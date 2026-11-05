@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tree_view::{Action, TreeView, View};
 
@@ -34,8 +34,36 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native("Process Tree", opts, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
 }
 
+/// A sleep that `wake` cuts short (sticky: a wake before `wait` makes it return at once).
+#[derive(Default)]
+struct Waker {
+    flag: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Waker {
+    fn wait(&self, d: Duration) {
+        let mut g = self.cv.wait_timeout_while(self.flag.lock().unwrap(), d, |f| !*f).unwrap().0;
+        *g = false;
+    }
+    fn wake(&self) {
+        *self.flag.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
+/// Tree kill from pid <= 1 (kernel_task / launchd) would hit nearly every process.
+pub fn tree_kill_allowed(pid: Pid) -> bool {
+    pid > 1
+}
+
+/// Duraklat on our own pid would freeze the UI beyond recovery.
+pub fn pause_allowed(pid: Pid) -> bool {
+    pid != std::process::id() as Pid
+}
+
 /// Samples every `every_ms` (re-read each round), hands the snapshot to the UI and wakes it; exits when the UI is gone.
-fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every_ms: Arc<AtomicU64>) -> Receiver<Result<Snapshot, DetailError>> {
+fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every_ms: Arc<AtomicU64>, waker: Arc<Waker>) -> Receiver<Result<Snapshot, DetailError>> {
     let (tx, rx) = channel();
     std::thread::Builder::new()
         .name("sampler".into())
@@ -45,7 +73,7 @@ fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every_ms: Arc<Atomi
                 return;
             }
             ctx.request_repaint();
-            std::thread::sleep(Duration::from_millis(every_ms.load(Ordering::Relaxed)));
+            waker.wait(Duration::from_millis(every_ms.load(Ordering::Relaxed)));
         })
         .expect("spawn sampler");
     rx
@@ -113,6 +141,9 @@ struct App {
     proc_hist: properties::ProcHistory,
     /// Sampler interval, shared with the sampler thread.
     interval: Arc<AtomicU64>,
+    /// Cuts the sampler's sleep short (refocus, interval change).
+    waker: Arc<Waker>,
+    was_focused: bool,
     /// The helper backend is installed.
     admin: bool,
     /// Elevation in progress on a worker thread.
@@ -133,7 +164,8 @@ impl App {
         settings.interval_ms = settings.interval_ms.clamp(500, 5000);
         let backend: SharedBackend = Arc::new(Mutex::new(Box::new(LocalBackend::new())));
         let interval = Arc::new(AtomicU64::new(settings.interval_ms));
-        let rx = spawn_sampler(backend.clone(), ctx.clone(), interval.clone());
+        let waker = Arc::new(Waker::default());
+        let rx = spawn_sampler(backend.clone(), ctx.clone(), interval.clone(), waker.clone());
         let c = ctx.clone();
         let mut app = Self {
             backend,
@@ -155,6 +187,8 @@ impl App {
             props: Default::default(),
             proc_hist: Default::default(),
             interval,
+            waker,
+            was_focused: true,
             admin: false,
             admin_rx: None,
             picking: false,
@@ -246,6 +280,9 @@ impl App {
                 self.interval.store(self.settings.interval_ms, Ordering::Relaxed);
             }
             save |= r.drag_stopped() || (r.changed() && !r.dragged());
+            if save {
+                self.waker.wake();
+            }
             ui.separator();
             vt_changed |= ui.checkbox(&mut self.settings.vt_enabled, "VirusTotal kontrolü").changed();
             ui.small("Yalnızca dosya özeti (SHA-256) gönderilir.");
@@ -311,6 +348,10 @@ impl App {
                     self.status = Some(format!("{} ({pid}): {}", self.name(pid), DetailError::NoSuchProcess));
                     return;
                 };
+                if tree && !tree_kill_allowed(pid) {
+                    self.status = Some("Bu süreç için ağaç sonlandırma devre dışı".into());
+                    return;
+                }
                 let targets = if tree { kill_tree_targets(&self.live, pid) } else { vec![(pid, p.start_time)] };
                 let text = if tree {
                     format!("{} ({pid}) ve {} alt süreç sonlandırılsın mı?", p.name, targets.len() - 1)
@@ -318,6 +359,9 @@ impl App {
                     format!("{} ({pid}) sonlandırılsın mı?", p.name)
                 };
                 self.confirm = Some(Confirm { text, targets, sig });
+            }
+            Action::Signal { pid, sig: Sig::Stop, .. } if !pause_allowed(pid) => {
+                self.status = Some("Uygulama kendini duraklatamaz".into());
             }
             Action::Signal { pid, start, sig } => self.signal(&[(pid, start)], sig),
             Action::Nice { pid, start } => self.nice = Some(Nice { pid, start, value: 0 }),
@@ -420,6 +464,7 @@ impl eframe::App for App {
                     *self.backend.lock().unwrap() = Box::new(c);
                     self.admin = true;
                     self.status = None;
+                    self.props.retry_denied(&self.backend, &self.ctx);
                 }
                 Err(msg) => self.status = Some(msg),
             }
@@ -433,6 +478,10 @@ impl eframe::App for App {
         let focused = ctx.input(|i| i.focused);
         let want = if focused { self.settings.interval_ms } else { self.settings.interval_ms.max(5000) };
         self.interval.store(want, Ordering::Relaxed);
+        if focused && !self.was_focused {
+            self.waker.wake();
+        }
+        self.was_focused = focused;
         let mut bar = toolbar::Out::default();
         egui::Panel::top("toolbar").show(ui, |ui| {
             bar = toolbar::show(ui, &self.history, &mut self.query, &mut self.settings.flat, self.admin, self.admin_rx.is_some());
@@ -549,6 +598,34 @@ mod tests {
         );
         assert!(r.err().unwrap().starts_with("Yönetici modu başlatılamadı"));
         assert!(!seen.borrow().as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn waker_wakes_early_and_is_sticky() {
+        let w = Arc::new(Waker::default());
+        let w2 = w.clone();
+        let t = Instant::now();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            w2.wake();
+        });
+        w.wait(Duration::from_secs(10));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        h.join().unwrap();
+        w.wake(); // wake before wait still returns at once
+        let t = Instant::now();
+        w.wait(Duration::from_secs(10));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let t = Instant::now();
+        w.wait(Duration::from_millis(50)); // flag was consumed: times out normally
+        assert!(t.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn kill_tree_and_pause_gates() {
+        assert!(!tree_kill_allowed(0) && !tree_kill_allowed(1) && tree_kill_allowed(2));
+        let own = std::process::id() as Pid;
+        assert!(!pause_allowed(own) && pause_allowed(own + 1));
     }
 
     #[test]

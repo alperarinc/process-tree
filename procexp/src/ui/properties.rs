@@ -98,12 +98,34 @@ impl Props {
             return;
         }
         self.wins.insert(key, Win { name, extra: None });
+        self.fetch(backend, ctx, key);
+    }
+
+    fn fetch(&self, backend: &SharedBackend, ctx: &egui::Context, key: Key) {
         let (b, tx, ctx) = (backend.clone(), self.tx.clone(), ctx.clone());
         let _ = std::thread::Builder::new().name("props".into()).spawn(move || {
             let r = b.lock().unwrap().proc_extra(key.0);
             let _ = tx.send((key, r));
             ctx.request_repaint();
         });
+    }
+
+    /// Backend swapped (admin mode on): windows that were denied get a fresh `proc_extra`.
+    pub fn retry_denied(&mut self, backend: &SharedBackend, ctx: &egui::Context) {
+        for key in self.take_denied() {
+            self.fetch(backend, ctx, key);
+        }
+    }
+
+    fn take_denied(&mut self) -> Vec<Key> {
+        let mut keys = vec![];
+        for (&k, w) in &mut self.wins {
+            if matches!(w.extra, Some(Err(DetailError::AccessDenied))) {
+                w.extra = None;
+                keys.push(k);
+            }
+        }
+        keys
     }
 
     pub fn show(&mut self, ctx: &egui::Context, live: &HashMap<Pid, ProcInfo>, view: &HashMap<Pid, ProcInfo>, hist: &ProcHistory, meta: &MetaCache) -> Out {
@@ -208,4 +230,20 @@ fn body(ui: &mut egui::Ui, p: &ProcInfo, w: &Win, view: &HashMap<Pid, ProcInfo>,
             graph(ui, "Bellek", &m, m.iter().cloned().fold(1.0, f64::max), Color32::from_rgb(255, 170, 60));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_denied_resets_only_access_denied() {
+        let mut p = Props::default();
+        p.wins.insert((1, 1), Win { name: "a".into(), extra: Some(Err(DetailError::AccessDenied)) });
+        p.wins.insert((2, 2), Win { name: "b".into(), extra: Some(Err(DetailError::NoSuchProcess)) });
+        p.wins.insert((3, 3), Win { name: "c".into(), extra: None });
+        assert_eq!(p.take_denied(), [(1, 1)]);
+        assert!(p.wins[&(1, 1)].extra.is_none());
+        assert!(matches!(p.wins[&(2, 2)].extra, Some(Err(DetailError::NoSuchProcess))));
+    }
 }

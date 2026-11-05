@@ -368,9 +368,6 @@ impl Backend for HelperClient {
             _ => self.dead(),
         }
     }
-    fn privileged(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

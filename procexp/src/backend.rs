@@ -12,7 +12,6 @@ pub trait Backend: Send {
     fn proc_extra(&mut self, pid: Pid) -> Result<ProcExtra, DetailError>;
     fn signal(&mut self, pid: Pid, start: u64, sig: Sig) -> Result<(), DetailError>;
     fn renice(&mut self, pid: Pid, start: u64, nice: i32) -> Result<(), DetailError>;
-    fn privileged(&self) -> bool;
 }
 
 #[derive(Default)]
@@ -47,8 +46,5 @@ impl Backend for LocalBackend {
     }
     fn renice(&mut self, pid: Pid, start: u64, nice: i32) -> Result<(), DetailError> {
         actions::renice(pid, start, nice)
-    }
-    fn privileged(&self) -> bool {
-        unsafe { libc::geteuid() == 0 }
     }
 }

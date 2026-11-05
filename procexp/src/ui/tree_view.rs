@@ -183,11 +183,11 @@ fn menu(ui: &mut egui::Ui, p: &ProcInfo, vt_on: bool) -> Option<Action> {
     if ui.button("Zorla sonlandır").clicked() {
         act = Some(Action::Kill { pid, sig: Sig::Kill, tree: false });
     }
-    if ui.button("Ağacı sonlandır").clicked() {
+    if ui.add_enabled(super::tree_kill_allowed(pid), egui::Button::new("Ağacı sonlandır")).clicked() {
         act = Some(Action::Kill { pid, sig: Sig::Kill, tree: true });
     }
     let (label, sig) = if matches!(p.status, ProcStatus::Stopped) { ("Devam ettir", Sig::Cont) } else { ("Duraklat", Sig::Stop) };
-    if ui.button(label).clicked() {
+    if ui.add_enabled(!matches!(sig, Sig::Stop) || super::pause_allowed(pid), egui::Button::new(label)).clicked() {
         act = Some(Action::Signal { pid, start, sig });
     }
     if ui.button("Öncelik…").clicked() {
