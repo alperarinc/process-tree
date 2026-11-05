@@ -73,6 +73,13 @@ impl RateLimiter {
         Self { per_min, per_day, recent: VecDeque::new(), day: 0, day_count: 0 }
     }
 
+    /// Whether `try_take` would succeed right now; consumes nothing.
+    pub fn can_take(&self, now_unix: u64) -> bool {
+        let recent = self.recent.iter().filter(|&&t| t + 60 > now_unix).count() as u32;
+        let day_count = if now_unix / 86_400 == self.day { self.day_count } else { 0 };
+        recent < self.per_min && day_count < self.per_day
+    }
+
     pub fn try_take(&mut self, now_unix: u64) -> bool {
         while self.recent.front().is_some_and(|&t| t + 60 <= now_unix) {
             self.recent.pop_front();
@@ -154,6 +161,8 @@ struct Inner {
     stop: bool,
     results: HashMap<String, Option<(u32, u32)>>,
     limiter: RateLimiter,
+    /// Failed attempts per sha this session; capped so a bad answer can't burn quota forever.
+    attempts: HashMap<String, u32>,
 }
 
 struct Shared {
@@ -165,6 +174,7 @@ pub struct VtService {
     shared: Arc<Shared>,
 }
 
+const MAX_ATTEMPTS: u32 = 3;
 const BAD_KEY_MSG: &str = "API anahtarı geçersiz";
 
 impl VtService {
@@ -188,6 +198,7 @@ impl VtService {
                 stop: false,
                 results: disk.results,
                 limiter,
+                attempts: HashMap::new(),
             }),
             cv: Condvar::new(),
         });
@@ -263,10 +274,13 @@ fn hash_file(path: &Path) -> std::io::Result<(String, (SystemTime, u64))> {
     Ok((hex, (md.modified()?, md.len())))
 }
 
-fn save_cache(path: &Path, g: &Inner) {
-    let d = DiskCache { results: g.results.clone(), day: g.limiter.day, day_count: g.limiter.day_count };
-    if let Ok(json) = serde_json::to_vec(&d) {
-        let _ = std::fs::write(path, json); // best effort; the cache is an optimisation
+fn snapshot(g: &Inner) -> DiskCache {
+    DiskCache { results: g.results.clone(), day: g.limiter.day, day_count: g.limiter.day_count }
+}
+
+fn save_cache(path: &Path, d: &DiskCache) {
+    if let Ok(json) = serde_json::to_vec(d) {
+        let _ = crate::settings::write_atomic(path, &json); // best effort; the cache is an optimisation
     }
 }
 
@@ -309,6 +323,11 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
             };
             continue;
         };
+        // Quota exhausted: stay silent (no state flip, no repaint) until it frees up.
+        if !g.limiter.can_take((cfg.now_unix)()) {
+            g.paused_until = Some(Instant::now() + cfg.poll);
+            continue;
+        }
         let path = g.queue[i].clone();
         g.retry_at.remove(&path);
         g.states.insert(path.clone(), VtState::Querying);
@@ -350,7 +369,6 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
         }
         if !g.limiter.try_take((cfg.now_unix)()) {
             g.states.insert(path, VtState::Pending);
-            g.paused_until = Some(Instant::now() + cfg.poll);
             continue;
         }
         let key = g.key.clone();
@@ -375,6 +393,10 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
                 g.states.insert(path, VtState::Pending);
                 g.paused_until = Some(Instant::now() + cfg.rate_pause);
             }
+            // A 401 for a key that set_key already replaced says nothing about the new one.
+            VtOutcome::BadKey if g.key != key => {
+                g.states.insert(path, VtState::Pending);
+            }
             VtOutcome::BadKey => {
                 g.bad_key = true;
                 let Inner { queue, states, .. } = &mut *g;
@@ -384,11 +406,18 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
             }
             VtOutcome::Error(msg) => {
                 g.states.insert(path.clone(), VtState::Error(msg));
-                g.retry_at.insert(path, Instant::now() + cfg.retry);
+                let n = g.attempts.entry(sha).or_insert(0);
+                *n += 1;
+                if *n >= MAX_ATTEMPTS {
+                    g.queue.retain(|p| *p != path); // give up for this session
+                } else {
+                    g.retry_at.insert(path, Instant::now() + cfg.retry);
+                }
             }
         }
-        save_cache(&cache_path, &g);
+        let snap = snapshot(&g);
         drop(g);
+        save_cache(&cache_path, &snap);
         repaint();
         g = sh.inner.lock().unwrap();
     }
@@ -490,6 +519,15 @@ mod tests {
         }
     }
 
+    /// The cache is written just after the state flips (outside the lock); rename is atomic.
+    fn wait_cache(dir: &Path) {
+        let t = Instant::now();
+        while !dir.join("vt-cache.json").exists() {
+            assert!(t.elapsed() < Duration::from_secs(5), "cache never written");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn done(s: &VtState) -> bool {
         matches!(s, VtState::Done { .. })
     }
@@ -515,6 +553,7 @@ mod tests {
         let s = svc(d.path(), &fake);
         s.enqueue(&a);
         wait_for(&s, &a, done);
+        wait_cache(d.path());
         drop(s);
         let fake2 = Fake::default();
         let s2 = svc(d.path(), &fake2);
@@ -573,6 +612,81 @@ mod tests {
         assert_eq!(fake.calls(), 1);
         wait_for(&s, &a, done);
         assert_eq!(fake.calls(), 2);
+    }
+
+    #[test]
+    fn repeated_errors_stop_after_three_attempts() {
+        let d = tempfile::tempdir().unwrap();
+        let a = file(d.path(), "a", "x");
+        let fake = Fake::default();
+        for _ in 0..5 {
+            fake.script(Ok((500, String::new())));
+        }
+        let s = svc(d.path(), &fake);
+        s.enqueue(&a);
+        wait_for(&s, &a, |st| matches!(st, VtState::Error(_)));
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(fake.calls(), 3);
+        assert_eq!(s.state(&a), VtState::Error("HTTP 500".into()));
+    }
+
+    #[test]
+    fn old_key_401_does_not_stop_queue_after_set_key() {
+        struct Slow(Fake);
+        impl VtHttp for Slow {
+            fn get(&self, sha: &str, key: &str) -> Resp {
+                std::thread::sleep(Duration::from_millis(150));
+                self.0.get(sha, key)
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let a = file(d.path(), "a", "x");
+        let fake = Fake::default();
+        fake.script(Ok((401, String::new())));
+        let s = VtService::with_config(d.path().join("vt-cache.json"), Box::new(Slow(fake.clone())), "old".into(), Box::new(|| {}), fast());
+        s.enqueue(&a);
+        wait_for(&s, &a, |st| *st == VtState::Querying);
+        s.set_key("new".into());
+        wait_for(&s, &a, done);
+        assert_eq!(fake.calls(), 2);
+    }
+
+    #[test]
+    fn exhausted_quota_does_not_flip_state_or_repaint() {
+        let d = tempfile::tempdir().unwrap();
+        let a = file(d.path(), "a", "x");
+        let fake = Fake::default();
+        let n = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let n2 = n.clone();
+        let cfg = VtConfig { now_unix: Box::new(|| 1_000_000), ..fast() };
+        let cache = DiskCache { day: 1_000_000 / 86_400, day_count: 500, ..Default::default() };
+        std::fs::write(d.path().join("vt-cache.json"), serde_json::to_vec(&cache).unwrap()).unwrap();
+        let s = VtService::with_config(d.path().join("vt-cache.json"), Box::new(fake.clone()), "k".into(), Box::new(move || { n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }), cfg);
+        s.enqueue(&a);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(s.state(&a), VtState::Pending);
+        assert_eq!((fake.calls(), n.load(std::sync::atomic::Ordering::SeqCst)), (0, 0));
+    }
+
+    #[test]
+    fn cache_write_is_atomic_and_ignores_leftover_tmp() {
+        let d = tempfile::tempdir().unwrap();
+        let a = file(d.path(), "a", "x");
+        let fake = Fake::default();
+        let s = svc(d.path(), &fake);
+        s.enqueue(&a);
+        wait_for(&s, &a, done);
+        wait_cache(d.path());
+        drop(s);
+        let real = d.path().join("vt-cache.json");
+        let parsed: DiskCache = serde_json::from_slice(&std::fs::read(&real).unwrap()).unwrap();
+        assert_eq!(parsed.results.len(), 1);
+        std::fs::write(d.path().join("vt-cache.json.tmp"), "{garbage").unwrap();
+        let fake2 = Fake::default();
+        let s2 = svc(d.path(), &fake2);
+        s2.enqueue(&a);
+        wait_for(&s2, &a, done);
+        assert_eq!(fake2.calls(), 0);
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub enum Column {
     Vt,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub interval_ms: u64,
@@ -40,6 +40,32 @@ impl Default for Settings {
     }
 }
 
+// Hand-written so `{:?}` can never leak the API key.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("interval_ms", &self.interval_ms)
+            .field("columns", &self.columns)
+            .field("flat", &self.flat)
+            .field("vt_enabled", &self.vt_enabled)
+            .field("vt_api_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Write via `<path>.tmp` (created 0600) + rename, so a crash never leaves a truncated file.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    // `mode` only applies on creation; tighten a leftover tmp too.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 /// `$HOME/Library/Application Support/ProcessTree`, created on demand.
 pub fn app_support_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -55,10 +81,7 @@ pub fn load(path: &Path) -> Settings {
 impl Settings {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        // `mode` only applies on creation; tighten a pre-existing file too.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(&json)
+        write_atomic(path, &json)
     }
 }
 
@@ -74,6 +97,24 @@ mod tests {
         s.save(&p).unwrap();
         assert_eq!(load(&p), s);
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn debug_redacts_key() {
+        let s = Settings { vt_api_key: "sekrit-key".into(), ..Default::default() };
+        assert!(!format!("{s:?}").contains("sekrit-key"));
+    }
+
+    #[test]
+    fn save_over_leftover_tmp_keeps_real_file_valid() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.json");
+        let s = Settings { interval_ms: 3000, ..Default::default() };
+        s.save(&p).unwrap();
+        std::fs::write(d.path().join("settings.json.tmp"), "garbage").unwrap();
+        assert_eq!(load(&p), s);
+        s.save(&p).unwrap();
+        assert_eq!(load(&p), s);
     }
 
     #[test]
