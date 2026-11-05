@@ -429,9 +429,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
-        // Unfocused: sample at least every 3 s, to stay under the 2 % background CPU budget.
+        // Unfocused: sample at least every 5 s, to stay under the 2 % background CPU budget.
         let focused = ctx.input(|i| i.focused);
-        let want = if focused { self.settings.interval_ms } else { self.settings.interval_ms.max(3000) };
+        let want = if focused { self.settings.interval_ms } else { self.settings.interval_ms.max(5000) };
         self.interval.store(want, Ordering::Relaxed);
         let mut bar = toolbar::Out::default();
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -466,7 +466,7 @@ impl eframe::App for App {
             self.details.toggle();
         }
         if self.details.visible {
-            let every = Duration::from_millis(self.settings.interval_ms);
+            let every = Duration::from_millis(want);
             egui::Panel::bottom("details").resizable(true).default_size(220.0).show(ui, |ui| {
                 self.details.show(ui, &self.backend, &self.live, self.tree.selected, every);
             });
