@@ -6,15 +6,20 @@ pub mod tree_view;
 
 use crate::actions;
 use crate::backend::{Backend, LocalBackend};
+use crate::darwin::windows;
+use crate::helper::{self, HelperClient};
 use crate::lifecycle::Tracker;
 use crate::metacache::MetaCache;
 use crate::model::{DetailError, Pid, ProcInfo, Sig, Snapshot};
-use crate::settings::{self, Settings};
+use crate::settings::{self, Column, Settings};
 use crate::tree::descendants_postorder;
+use crate::vt::{self, UreqHttp, VtService};
 use eframe::egui;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tree_view::{Action, TreeView, View};
@@ -29,8 +34,8 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native("Process Tree", opts, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
 }
 
-/// Samples every `every`, hands the snapshot to the UI and wakes it; exits when the UI is gone.
-fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every: Duration) -> Receiver<Result<Snapshot, DetailError>> {
+/// Samples every `every_ms` (re-read each round), hands the snapshot to the UI and wakes it; exits when the UI is gone.
+fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every_ms: Arc<AtomicU64>) -> Receiver<Result<Snapshot, DetailError>> {
     let (tx, rx) = channel();
     std::thread::Builder::new()
         .name("sampler".into())
@@ -40,7 +45,7 @@ fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every: Duration) ->
                 return;
             }
             ctx.request_repaint();
-            std::thread::sleep(every);
+            std::thread::sleep(Duration::from_millis(every_ms.load(Ordering::Relaxed)));
         })
         .expect("spawn sampler");
     rx
@@ -50,6 +55,27 @@ fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every: Duration) ->
 pub fn kill_tree_targets(live: &HashMap<Pid, ProcInfo>, root: Pid) -> Vec<(Pid, u64)> {
     // descendants_postorder returns [root] even when root is absent; the filter drops it.
     descendants_postorder(live, root).iter().filter_map(|q| live.get(q)).map(|q| (q.pid, q.start_time)).collect()
+}
+
+const ADMIN_CANCELLED: &str = "Yönetici modu iptal edildi";
+
+/// prepare_dir → `launch` (blocks on the password prompt) → `connect`. On failure removes the temp
+/// dir and token itself: the client only cleans up once it exists.
+fn elevate(
+    launch: impl FnOnce(&Path) -> io::Result<()>,
+    connect: impl FnOnce(&Path, &str) -> io::Result<HelperClient>,
+) -> Result<HelperClient, String> {
+    let fail = |e: io::Error| format!("Yönetici modu başlatılamadı: {e}");
+    let (dir, token) = helper::prepare_dir().map_err(fail)?;
+    // osascript reports a cancelled prompt only as a non-zero exit, so any launch error reads as cancel.
+    let r = match launch(&dir) {
+        Err(_) => Err(ADMIN_CANCELLED.to_string()),
+        Ok(()) => connect(&dir, &token).map_err(fail),
+    };
+    if r.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    r
 }
 
 struct Confirm {
@@ -85,16 +111,31 @@ struct App {
     details: details::Details,
     props: properties::Props,
     proc_hist: properties::ProcHistory,
+    /// Sampler interval, shared with the sampler thread.
+    interval: Arc<AtomicU64>,
+    /// The helper backend is installed.
+    admin: bool,
+    /// Elevation in progress on a worker thread.
+    admin_rx: Option<Receiver<Result<HelperClient, String>>>,
+    /// Nişangâh drag in progress.
+    picking: bool,
+    settings_open: bool,
+    /// API key edited but not yet applied (applied when the field loses focus).
+    key_dirty: bool,
+    vt: Option<VtService>,
 }
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         let settings_path = settings::app_support_dir().join("settings.json");
-        let settings = settings::load(&settings_path);
+        let mut settings = settings::load(&settings_path);
+        // A hand-edited 0 would make the sampler spin.
+        settings.interval_ms = settings.interval_ms.clamp(500, 5000);
         let backend: SharedBackend = Arc::new(Mutex::new(Box::new(LocalBackend::new())));
-        let rx = spawn_sampler(backend.clone(), ctx.clone(), Duration::from_millis(settings.interval_ms));
+        let interval = Arc::new(AtomicU64::new(settings.interval_ms));
+        let rx = spawn_sampler(backend.clone(), ctx.clone(), interval.clone());
         let c = ctx.clone();
-        Self {
+        let mut app = Self {
             backend,
             rx,
             settings,
@@ -113,7 +154,124 @@ impl App {
             details: Default::default(),
             props: Default::default(),
             proc_hist: Default::default(),
+            interval,
+            admin: false,
+            admin_rx: None,
+            picking: false,
+            settings_open: false,
+            key_dirty: false,
+            vt: None,
+        };
+        app.sync_vt();
+        app
+    }
+
+    /// Start or stop the VirusTotal service to match the settings; no service (no network) unless on with a key.
+    fn sync_vt(&mut self) {
+        let on = self.settings.vt_enabled && !self.settings.vt_api_key.is_empty();
+        match (&self.vt, on) {
+            (None, true) => {
+                let c = self.ctx.clone();
+                let s = VtService::new(vt::default_cache_path(), Box::new(UreqHttp), self.settings.vt_api_key.clone(), Box::new(move || c.request_repaint()));
+                for p in self.live.values() {
+                    if let Some(e) = &p.exe {
+                        s.enqueue(e);
+                    }
+                }
+                self.vt = Some(s);
+            }
+            (Some(s), true) => s.set_key(self.settings.vt_api_key.clone()),
+            (Some(_), false) => self.vt = None,
+            (None, false) => {}
         }
+    }
+
+    fn set_column(&mut self, c: Column, on: bool) {
+        let mut cols: Vec<_> = self.settings.columns.iter().copied().filter(|&x| x != c).collect();
+        if on {
+            cols.push(c);
+        }
+        self.settings.columns = tree_view::ALL_COLUMNS.into_iter().filter(|c| cols.contains(c)).collect();
+    }
+
+    fn start_admin(&mut self) {
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        std::thread::Builder::new()
+            .name("elevate".into())
+            .spawn(move || {
+                let r = elevate(
+                    |d| helper::launch(&std::env::current_exe()?, d),
+                    |d, t| HelperClient::connect(d, t, Duration::from_secs(30)),
+                );
+                let _ = tx.send(r);
+                ctx.request_repaint();
+            })
+            .expect("spawn elevate");
+        self.admin_rx = Some(rx);
+    }
+
+    /// Any `Disconnected` while in Yönetici modu: back to the local backend. Sampler and detail
+    /// workers lock the shared slot per call, so they simply use the new backend on their next call.
+    fn on_error(&mut self, e: &DetailError) {
+        if self.admin && matches!(e, DetailError::Disconnected) {
+            *self.backend.lock().unwrap() = Box::new(LocalBackend::new());
+            self.admin = false;
+            self.status = Some("Yönetici bağlantısı koptu — normal moda dönüldü".into());
+        }
+    }
+
+    /// Nişangâh released: select the process owning the front-most window under the mouse.
+    fn pick(&mut self) {
+        let (x, y) = windows::global_mouse();
+        let own = std::process::id() as Pid;
+        // -1 excludes nothing: our own window in front counts as a miss, not the window behind it.
+        let hit = windows::pick_window(&windows::on_screen_windows(), x, y, -1).filter(|&p| p != own);
+        match hit.and_then(|pid| self.live.get(&pid)) {
+            Some(p) => {
+                let (pid, start) = (p.pid, p.start_time);
+                self.tree.reveal(pid, start, &self.live);
+                self.status = None;
+            }
+            None => self.status = Some("Pencere bulunamadı".into()),
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        let (mut save, mut vt_changed) = (false, false);
+        egui::Window::new("Ayarlar").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            let r = ui.add(egui::Slider::new(&mut self.settings.interval_ms, 500..=5000).text("Yenileme aralığı").suffix(" ms"));
+            if r.changed() {
+                self.interval.store(self.settings.interval_ms, Ordering::Relaxed);
+            }
+            save |= r.drag_stopped() || (r.changed() && !r.dragged());
+            ui.separator();
+            vt_changed |= ui.checkbox(&mut self.settings.vt_enabled, "VirusTotal kontrolü").changed();
+            ui.small("Yalnızca dosya özeti (SHA-256) gönderilir.");
+            ui.horizontal(|ui| {
+                ui.label("API anahtarı");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.settings.vt_api_key).password(true).desired_width(260.0));
+                self.key_dirty |= r.changed();
+                if r.lost_focus() && std::mem::take(&mut self.key_dirty) {
+                    vt_changed = true;
+                }
+            });
+        });
+        if !open && std::mem::take(&mut self.key_dirty) {
+            vt_changed = true;
+        }
+        if vt_changed {
+            let had = self.vt.is_some();
+            self.sync_vt();
+            if had != self.vt.is_some() {
+                self.set_column(Column::Vt, self.vt.is_some());
+            }
+        }
+        if save || vt_changed {
+            self.save_settings();
+        }
+        self.settings_open = open;
     }
 
     fn save_settings(&mut self) {
@@ -135,6 +293,11 @@ impl App {
             .filter_map(|(i, &(pid, start))| be.signal(pid, start, sig.clone()).err().map(|e| (i, pid, e)))
             .collect();
         drop(be);
+        if let Some((_, _, e)) = errs.iter().find(|(_, _, e)| matches!(e, DetailError::Disconnected)) {
+            let e = e.clone();
+            self.on_error(&e);
+            return;
+        }
         let root = targets.len().saturating_sub(1);
         let err = errs.into_iter().find(|(i, _, e)| *i == root || !matches!(e, DetailError::NoSuchProcess)).map(|(_, pid, e)| (pid, e));
         self.status = err.map(|(pid, e)| format!("{} ({pid}): {e}", self.name(pid)));
@@ -170,14 +333,13 @@ impl App {
                 }
             }
             Action::ToggleColumn(c) => {
-                let mut on: Vec<_> = self.settings.columns.clone();
-                if let Some(i) = on.iter().position(|&x| x == c) {
-                    on.remove(i);
-                } else {
-                    on.push(c);
-                }
-                self.settings.columns = tree_view::ALL_COLUMNS.into_iter().filter(|c| on.contains(c)).collect();
+                self.set_column(c, !self.settings.columns.contains(&c));
                 self.save_settings();
+            }
+            Action::VtCheck(exe) => {
+                if let Some(s) = &self.vt {
+                    s.prioritize(&exe);
+                }
             }
         }
     }
@@ -215,6 +377,7 @@ impl App {
                 let r = self.backend.lock().unwrap().renice(n.pid, n.start, n.value);
                 if let Err(e) = r {
                     self.status = Some(format!("{} ({}): {e}", self.name(n.pid), n.pid));
+                    self.on_error(&e);
                 }
             } else if cancel || r.should_close() {
                 self.nice = None;
@@ -235,9 +398,30 @@ impl eframe::App for App {
                         self.view.entry(g.pid).or_insert(g);
                     }
                     properties::record(&mut self.proc_hist, &snap.procs, &self.view);
+                    if let Some(vt) = &self.vt {
+                        // enqueue is a no-op for paths it has seen, so new processes are picked up here.
+                        for e in snap.procs.values().filter_map(|p| p.exe.as_deref()) {
+                            vt.enqueue(e);
+                        }
+                    }
                     self.live = snap.procs;
                 }
-                Err(e) => self.status = Some(e.to_string()),
+                Err(e) => {
+                    self.status = Some(e.to_string());
+                    self.on_error(&e);
+                }
+            }
+        }
+        let got = self.admin_rx.as_ref().map(|rx| rx.try_recv());
+        if let Some(r) = got.filter(|r| !matches!(r, Err(TryRecvError::Empty))) {
+            self.admin_rx = None;
+            match r.unwrap_or_else(|_| Err("Yönetici modu başlatılamadı".into())) {
+                Ok(c) => {
+                    *self.backend.lock().unwrap() = Box::new(c);
+                    self.admin = true;
+                    self.status = None;
+                }
+                Err(msg) => self.status = Some(msg),
             }
         }
     }
@@ -245,13 +429,33 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let mut bar = toolbar::Out::default();
         egui::Panel::top("toolbar").show(ui, |ui| {
-            if toolbar::show(ui, &self.history, &mut self.query, &mut self.settings.flat) {
-                self.save_settings();
-            }
+            bar = toolbar::show(ui, &self.history, &mut self.query, &mut self.settings.flat, self.admin, self.admin_rx.is_some());
         });
+        if bar.mode_changed {
+            self.save_settings();
+        }
+        if bar.admin {
+            self.start_admin();
+        }
+        if bar.settings {
+            self.settings_open = true;
+        }
+        self.picking |= bar.pick;
+        if self.picking {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            if windows::left_mouse_down() {
+                // Polling the global button state needs frames while the mouse is outside our window.
+                ctx.request_repaint();
+            } else {
+                self.picking = false;
+                self.pick();
+            }
+        }
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.label(self.status.clone().unwrap_or_else(|| format!("{} süreç", self.live.len())));
+            let text = if self.admin_rx.is_some() { Some("Yönetici modu bekleniyor…".to_string()) } else { self.status.clone() };
+            ui.label(text.unwrap_or_else(|| format!("{} süreç", self.live.len())));
         });
         let mut act = None;
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L)) {
@@ -275,6 +479,7 @@ impl eframe::App for App {
                     flat: self.settings.flat,
                     load_meta: !minimized,
                     modal_open: self.confirm.is_some() || self.nice.is_some(),
+                    vt: self.vt.as_ref(),
                 },
             );
         });
@@ -288,6 +493,7 @@ impl eframe::App for App {
         if let Some(p) = out.reveal {
             self.handle(Action::Reveal(p));
         }
+        self.settings_window(&ctx);
         self.dialogs(&ctx);
     }
 }
@@ -313,6 +519,32 @@ mod tests {
             disk_read: 0,
             disk_write: 0,
         }
+    }
+
+    #[test]
+    fn elevate_removes_temp_dir_when_cancelled_or_connect_fails() {
+        let seen = std::cell::RefCell::new(None);
+        let r = elevate(
+            |d| {
+                assert!(d.join("token").exists());
+                *seen.borrow_mut() = Some(d.to_path_buf());
+                Err(io::Error::other("osascript: exit status: 1"))
+            },
+            |_, _| unreachable!("no connect after a cancelled prompt"),
+        );
+        assert_eq!(r.err().as_deref(), Some(ADMIN_CANCELLED));
+        assert!(!seen.borrow().as_ref().unwrap().exists());
+
+        let r = elevate(
+            |d| {
+                *seen.borrow_mut() = Some(d.to_path_buf());
+                std::fs::write(d.join("sock"), "").unwrap(); // stands in for the helper's socket
+                Ok(())
+            },
+            |_, _| Err(io::ErrorKind::TimedOut.into()),
+        );
+        assert!(r.err().unwrap().starts_with("Yönetici modu başlatılamadı"));
+        assert!(!seen.borrow().as_ref().unwrap().exists());
     }
 
     #[test]

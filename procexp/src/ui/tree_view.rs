@@ -5,7 +5,7 @@ use crate::metacache::{Meta, MetaCache};
 use crate::model::{Pid, ProcInfo, ProcStatus, Sig};
 use crate::settings::Column;
 use crate::tree::{build_rows, ViewOpts};
-use crate::vt::VtState;
+use crate::vt::{VtService, VtState};
 use eframe::egui::{self, Align, Color32, Key, Label, Layout, RichText, Sense, TextureHandle};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -89,6 +89,8 @@ pub enum Action {
     Reveal(PathBuf),
     Properties { pid: Pid, start: u64 },
     ToggleColumn(Column),
+    /// Move this exe to the front of the VirusTotal queue.
+    VtCheck(PathBuf),
 }
 
 /// Per-frame inputs owned by the app.
@@ -103,6 +105,8 @@ pub struct View<'a> {
     pub load_meta: bool,
     /// A confirmation/Öncelik dialog is open: keys must not retarget it.
     pub modal_open: bool,
+    /// Present only while VirusTotal is on.
+    pub vt: Option<&'a VtService>,
 }
 
 pub struct TreeView {
@@ -113,12 +117,14 @@ pub struct TreeView {
     sort: Column,
     desc: bool,
     scroll_to: Option<usize>,
+    /// Scroll to `selected` on the next frame (set by `reveal`).
+    scroll_sel: bool,
     icons: HashMap<PathBuf, Option<TextureHandle>>,
 }
 
 impl Default for TreeView {
     fn default() -> Self {
-        Self { selected: None, menu_target: None, collapsed: HashSet::new(), sort: Column::Pid, desc: false, scroll_to: None, icons: HashMap::new() }
+        Self { selected: None, menu_target: None, collapsed: HashSet::new(), sort: Column::Pid, desc: false, scroll_to: None, scroll_sel: false, icons: HashMap::new() }
     }
 }
 
@@ -155,12 +161,20 @@ fn cell_text(c: Column, p: &ProcInfo, m: Option<&Meta>) -> String {
         Column::User => if p.user.is_empty() { dash() } else { p.user.clone() },
         Column::Description => m.and_then(|m| m.description.clone()).unwrap_or_else(dash),
         Column::Company => m.and_then(|m| m.company.clone()).unwrap_or_else(dash),
-        // Task 12 wires VtService; until then there is no state to show.
-        Column::Vt => dash(),
+        Column::Vt => dash(), // rendered by vt_cell
     }
 }
 
-fn menu(ui: &mut egui::Ui, p: &ProcInfo) -> Option<Action> {
+/// VirusTotal cell: state text, red when any engine flags the file.
+fn vt_cell(s: Option<&VtState>) -> RichText {
+    match s {
+        None => RichText::new("—"),
+        Some(s @ VtState::Done { malicious, .. }) if *malicious > 0 => RichText::new(s.text()).color(Color32::RED),
+        Some(s) => RichText::new(s.text()),
+    }
+}
+
+fn menu(ui: &mut egui::Ui, p: &ProcInfo, vt_on: bool) -> Option<Action> {
     let (pid, start) = (p.pid, p.start_time);
     let mut act = None;
     if ui.button("Sonlandır").clicked() {
@@ -186,23 +200,46 @@ fn menu(ui: &mut egui::Ui, p: &ProcInfo) -> Option<Action> {
     if ui.button("Özellikler").clicked() {
         act = Some(Action::Properties { pid, start });
     }
+    if vt_on && ui.add_enabled(p.exe.is_some(), egui::Button::new("VirusTotal'da şimdi kontrol et")).clicked() {
+        act = p.exe.clone().map(Action::VtCheck);
+    }
     act
 }
 
 impl TreeView {
+    /// Select `(pid, start)`, unfold its ancestors and scroll to it on the next frame.
+    pub fn reveal(&mut self, pid: Pid, start: u64, procs: &HashMap<Pid, ProcInfo>) {
+        self.selected = Some((pid, start));
+        self.scroll_sel = true;
+        let mut seen = HashSet::new();
+        let mut cur = procs.get(&pid).map(|p| p.ppid);
+        // `seen` stops PID == PPID and longer cycles.
+        while let Some(pp) = cur.filter(|pp| seen.insert(*pp)) {
+            self.collapsed.remove(&pp);
+            cur = procs.get(&pp).map(|p| p.ppid);
+        }
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, v: &View) -> Option<Action> {
-        let Self { selected, menu_target, collapsed, sort, desc, scroll_to, icons } = self;
+        let Self { selected, menu_target, collapsed, sort, desc, scroll_to, scroll_sel, icons } = self;
         let meta_of = |p: &ProcInfo| -> Option<Arc<Meta>> {
             if !v.load_meta {
                 return None;
             }
             p.exe.as_deref().and_then(|e| v.meta.get(e))
         };
-        let meta_fn = |p: &ProcInfo| meta_of(p).map_or((None, None, None), |m| (m.description.clone(), m.company.clone(), None));
+        let vt_of = |p: &ProcInfo| Some(v.vt?.state(p.exe.as_deref()?));
+        let meta_fn = |p: &ProcInfo| {
+            let (d, c) = meta_of(p).map_or((None, None), |m| (m.description.clone(), m.company.clone()));
+            (d, c, vt_of(p))
+        };
         // shortcut: rows rebuilt every frame (frames only happen on new data/input); cache if profiling says so.
         let rows = build_rows(v.procs, &ViewOpts { collapsed, query: v.query, flat: v.flat }, &comparator(*sort, *desc, &meta_fn));
         let start_of = |pid: Pid| v.procs[&pid].start_time;
         let sel_idx = rows.iter().position(|r| Some((r.pid, start_of(r.pid))) == *selected);
+        if std::mem::take(scroll_sel) {
+            *scroll_to = sel_idx;
+        }
 
         let mut act = None;
         let mut new_idx = None;
@@ -295,6 +332,14 @@ impl TreeView {
                             pt.set_clip_rect(rect.intersect(clip));
                             pt.rect_filled(rect, 0.0, col);
                         }
+                        if c == Column::Vt {
+                            let s = vt_of(p);
+                            let r = ui.add(Label::new(vt_cell(s.as_ref())).selectable(false));
+                            if let Some(VtState::Error(why)) = s {
+                                r.on_hover_text(why);
+                            }
+                            return;
+                        }
                         if c != Column::Name {
                             ui.add(Label::new(cell_text(c, p, m.as_deref())).selectable(false));
                             return;
@@ -344,7 +389,7 @@ impl TreeView {
                         .filter(|t| v.tracker.life(t.pid) != Life::Exited);
                     match target {
                         Some(t) => {
-                            if let Some(a) = menu(ui, t) {
+                            if let Some(a) = menu(ui, t, v.vt.is_some()) {
                                 act = Some(a);
                             }
                         }
@@ -401,6 +446,31 @@ mod tests {
         let c = comparator(col, desc, meta);
         v.sort_by(|a, b| c(a, b));
         v.iter().map(|x| x.pid).collect()
+    }
+
+    #[test]
+    fn reveal_unfolds_ancestors_and_survives_cycles() {
+        let mut procs: HashMap<Pid, ProcInfo> = HashMap::new();
+        for (pid, ppid) in [(1, 1), (10, 1), (11, 10), (12, 11), (20, 21), (21, 20)] {
+            procs.insert(pid, ProcInfo { ppid, ..p(pid, 0.0) });
+        }
+        let mut t = TreeView::default();
+        t.collapsed.extend([1, 10, 11, 12, 20]);
+        t.reveal(12, 0, &procs);
+        assert_eq!(t.selected, Some((12, 0)));
+        assert!(t.scroll_sel);
+        assert_eq!(t.collapsed, HashSet::from([12, 20]));
+        t.reveal(20, 0, &procs); // 20 <-> 21 cycle must terminate
+        assert!(!t.collapsed.contains(&20));
+    }
+
+    #[test]
+    fn vt_cell_red_only_when_flagged() {
+        let flagged = VtState::Done { malicious: 2, total: 70 };
+        assert_eq!(vt_cell(Some(&flagged)), RichText::new("2/70").color(Color32::RED));
+        assert_eq!(vt_cell(Some(&VtState::Done { malicious: 0, total: 70 })), RichText::new("0/70"));
+        assert_eq!(vt_cell(Some(&VtState::Pending)), RichText::new("bekliyor"));
+        assert_eq!(vt_cell(None), RichText::new("—"));
     }
 
     #[test]

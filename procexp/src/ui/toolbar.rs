@@ -49,9 +49,20 @@ fn graph(ui: &mut egui::Ui, label: String, ring: &Ring<f32>, max: Option<f32>, c
     });
 }
 
-/// Returns true when the tree/list mode changed.
-pub fn show(ui: &mut egui::Ui, h: &History, query: &mut String, flat: &mut bool) -> bool {
+#[derive(Default)]
+pub struct Out {
+    /// Tree/list mode changed.
+    pub mode_changed: bool,
+    pub admin: bool,
+    /// Drag started on Nişangâh: enter picking mode.
+    pub pick: bool,
+    pub settings: bool,
+}
+
+/// `admin`: helper connected; `admin_pending`: password prompt / connect in progress.
+pub fn show(ui: &mut egui::Ui, h: &History, query: &mut String, flat: &mut bool, admin: bool, admin_pending: bool) -> Out {
     let was = *flat;
+    let mut out = Out::default();
     ui.horizontal(|ui| {
         let s = h.last.as_ref();
         graph(ui, format!("CPU {}%", fmt::pct(s.map_or(0.0, |s| s.cpu))), &h.cpu, Some(100.0), Color32::from_rgb(80, 200, 80));
@@ -64,10 +75,16 @@ pub fn show(ui: &mut egui::Ui, h: &History, query: &mut String, flat: &mut bool)
         ui.label("/");
         ui.selectable_value(flat, true, "Liste");
         ui.separator();
-        // Wired in Task 12.
-        let _ = ui.button("Yönetici modu");
-        let _ = ui.button("Nişangâh");
-        let _ = ui.button("Ayarlar");
+        out.admin = ui.add_enabled(!admin && !admin_pending, egui::Button::new("Yönetici modu")).clicked();
+        if admin {
+            ui.label(egui::RichText::new("Yönetici").strong().color(Color32::from_rgb(230, 120, 40)));
+        }
+        out.pick = ui
+            .add(egui::Button::new("Nişangâh").sense(Sense::click_and_drag()))
+            .on_hover_text("Basılı tutup bir pencerenin üzerine sürükleyin")
+            .drag_started();
+        out.settings = ui.button("Ayarlar").clicked();
     });
-    was != *flat
+    out.mode_changed = was != *flat;
+    out
 }
