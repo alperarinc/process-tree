@@ -70,7 +70,9 @@ fn established_and_unix_and_pipe_are_listed() {
             if local.ends_with(&format!(":{cport}")) && remote.starts_with("127.0.0.1:") && state == "ESTABLISHED")));
     assert!(all.iter().any(|e| matches!(e,
         FdEntry::Socket{proto: Proto::Unix, local, ..} if local == sock.to_str().unwrap())));
-    assert!(all.iter().any(|e| matches!(e, FdEntry::Pipe { fd } if *fd == fds[0])));
+    assert!(all
+        .iter()
+        .any(|e| matches!(e, FdEntry::Pipe { fd } if *fd == fds[0])));
 }
 
 #[test]
@@ -138,4 +140,79 @@ fn proc_extra_of_exited_process_is_no_such_process() {
     let pid = c.id() as i32;
     c.wait().unwrap();
     assert!(matches!(proc_extra(pid), Err(DetailError::NoSuchProcess)));
+}
+
+mod sampler {
+    use super::*;
+    use procexp::sampler::LocalSampler;
+    use std::time::{Duration, Instant};
+
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn snapshot_contains_self_with_parent() {
+        let snap = LocalSampler::new().sample();
+        let p = snap.procs.get(&me()).expect("self in snapshot");
+        assert_eq!(p.ppid, unsafe { libc::getppid() });
+        assert!(p.threads.unwrap() >= 1);
+        assert!(p.mem > 0);
+    }
+
+    #[test]
+    fn child_appears_under_parent() {
+        let child = Kill(Command::new("sleep").arg("5").spawn().unwrap());
+        let snap = LocalSampler::new().sample();
+        let c = snap
+            .procs
+            .get(&(child.0.id() as Pid))
+            .expect("child in snapshot");
+        assert_eq!(c.ppid, me());
+    }
+
+    #[test]
+    fn second_sample_has_cpu_for_busy_thread() {
+        let mut s = LocalSampler::new();
+        s.sample();
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || {
+            while t0.elapsed() < Duration::from_millis(1500) {
+                std::hint::black_box(0u64);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        let snap = s.sample();
+        h.join().unwrap();
+        let cpu = snap.procs[&me()].cpu;
+        assert!(cpu > 20.0, "cpu={cpu}");
+    }
+
+    #[test]
+    fn system_totals_sane() {
+        let mut s = LocalSampler::new();
+        s.sample();
+        std::thread::sleep(Duration::from_millis(300));
+        let sys = s.sample().system;
+        assert!(sys.mem_total > sys.mem_used && sys.mem_used > 0);
+        assert!((0.0..=100.0).contains(&sys.cpu), "cpu={}", sys.cpu);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_sample_wall_time() {
+        let mut s = LocalSampler::new();
+        s.sample();
+        let t = Instant::now();
+        for _ in 0..10 {
+            s.sample();
+        }
+        let avg = t.elapsed() / 10;
+        println!("avg sample = {avg:?}");
+        assert!(avg < Duration::from_millis(30), "avg={avg:?}");
+    }
 }
