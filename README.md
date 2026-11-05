@@ -61,7 +61,6 @@ Needs Rust 1.92+ and Xcode Command Line Tools.
 - Most system libraries live in the dyld shared cache, so the *Libraries* tab shows the cache file rather than each framework.
 - Per-process GPU usage isn't available (macOS has no reliable public source for it).
 - Some SIP-protected processes stay unreadable even in admin mode.
-- The UI is currently in Turkish.
 
 ## License
 

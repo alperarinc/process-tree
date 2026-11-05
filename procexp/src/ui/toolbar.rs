@@ -66,24 +66,24 @@ pub fn show(ui: &mut egui::Ui, h: &History, query: &mut String, flat: &mut bool,
     ui.horizontal(|ui| {
         let s = h.last.as_ref();
         graph(ui, format!("CPU {}%", fmt::pct(s.map_or(0.0, |s| s.cpu))), &h.cpu, Some(100.0), Color32::from_rgb(80, 200, 80));
-        graph(ui, format!("Bellek {}", fmt::bytes(s.map_or(0, |s| s.mem_used))), &h.mem, Some(100.0), Color32::from_rgb(230, 180, 60));
+        graph(ui, format!("Memory {}", fmt::bytes(s.map_or(0, |s| s.mem_used))), &h.mem, Some(100.0), Color32::from_rgb(230, 180, 60));
         graph(ui, format!("Disk {}", fmt::rate(s.map_or(0, |s| s.disk_read_bps + s.disk_write_bps))), &h.disk, None, Color32::from_rgb(90, 150, 240));
-        graph(ui, format!("Ağ {}", fmt::rate(s.map_or(0, |s| s.net_rx_bps + s.net_tx_bps))), &h.net, None, Color32::from_rgb(200, 100, 220));
+        graph(ui, format!("Network {}", fmt::rate(s.map_or(0, |s| s.net_rx_bps + s.net_tx_bps))), &h.net, None, Color32::from_rgb(200, 100, 220));
         ui.separator();
-        ui.add(egui::TextEdit::singleline(query).hint_text("Ara: ad, PID veya yol").desired_width(220.0));
-        ui.selectable_value(flat, false, "Ağaç");
+        ui.add(egui::TextEdit::singleline(query).hint_text("Search: name, PID or path").desired_width(220.0));
+        ui.selectable_value(flat, false, "Tree");
         ui.label("/");
-        ui.selectable_value(flat, true, "Liste");
+        ui.selectable_value(flat, true, "List");
         ui.separator();
-        out.admin = ui.add_enabled(!admin && !admin_pending, egui::Button::new("Yönetici modu")).clicked();
+        out.admin = ui.add_enabled(!admin && !admin_pending, egui::Button::new("Admin mode")).clicked();
         if admin {
-            ui.label(egui::RichText::new("Yönetici").strong().color(Color32::from_rgb(230, 120, 40)));
+            ui.label(egui::RichText::new("Admin").strong().color(Color32::from_rgb(230, 120, 40)));
         }
         out.pick = ui
-            .add(egui::Button::new("Nişangâh").sense(Sense::click_and_drag()))
-            .on_hover_text("Basılı tutup bir pencerenin üzerine sürükleyin")
+            .add(egui::Button::new("Crosshair").sense(Sense::click_and_drag()))
+            .on_hover_text("Press and drag onto any window")
             .drag_started();
-        out.settings = ui.button("Ayarlar").clicked();
+        out.settings = ui.button("Settings").clicked();
     });
     out.mode_changed = was != *flat;
     out

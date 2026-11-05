@@ -20,11 +20,11 @@ pub enum VtState {
 impl VtState {
     pub fn text(&self) -> String {
         match self {
-            VtState::Pending => "bekliyor".into(),
-            VtState::Querying => "sorgulanıyor".into(),
-            VtState::Unknown => "bilinmiyor".into(),
+            VtState::Pending => "pending".into(),
+            VtState::Querying => "querying".into(),
+            VtState::Unknown => "unknown".into(),
             VtState::Done { malicious, total } => format!("{malicious}/{total}"),
-            VtState::Error(_) => "hata".into(),
+            VtState::Error(_) => "error".into(),
         }
     }
 }
@@ -43,12 +43,12 @@ pub fn parse_response(status: u16, body: &str) -> VtOutcome {
         200 => {
             let v: serde_json::Value = match serde_json::from_str(body) {
                 Ok(v) => v,
-                Err(e) => return VtOutcome::Error(format!("yanıt çözülemedi: {e}")),
+                Err(e) => return VtOutcome::Error(format!("could not parse response: {e}")),
             };
             let stats = &v["data"]["attributes"]["last_analysis_stats"];
             let n = |k: &str| stats[k].as_u64().unwrap_or(0) as u32;
             if !stats.is_object() {
-                return VtOutcome::Error("yanıtta analiz özeti yok".into());
+                return VtOutcome::Error("no analysis stats in response".into());
             }
             VtOutcome::Done { malicious: n("malicious"), total: n("malicious") + n("suspicious") + n("undetected") + n("harmless") }
         }
@@ -168,7 +168,7 @@ pub struct VtService {
 }
 
 const MAX_ATTEMPTS: u32 = 3;
-const BAD_KEY_MSG: &str = "API anahtarı geçersiz";
+const BAD_KEY_MSG: &str = "Invalid API key";
 
 impl VtService {
     pub fn new(cache_path: PathBuf, http: Box<dyn VtHttp>, key: String, repaint: Box<dyn Fn() + Send>) -> Self {
@@ -349,7 +349,7 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
             Ok(s) => s,
             Err(_) => {
                 g.queue.remove(pos);
-                g.states.insert(path, VtState::Error("okunamadı".into()));
+                g.states.insert(path, VtState::Error("unreadable".into()));
                 drop(g);
                 repaint();
                 g = sh.inner.lock().unwrap();
@@ -589,7 +589,7 @@ mod tests {
         let s = svc(d.path(), &fake);
         s.enqueue(&a);
         s.enqueue(&b);
-        let err = VtState::Error("API anahtarı geçersiz".into());
+        let err = VtState::Error("Invalid API key".into());
         wait_for(&s, &a, |st| *st == err);
         wait_for(&s, &b, |st| *st == err);
         std::thread::sleep(Duration::from_millis(200));
@@ -685,7 +685,7 @@ mod tests {
         s.enqueue(&cached);
         s.enqueue(&gone);
         assert_eq!(wait_for(&s, &cached, done), VtState::Done { malicious: 1, total: 5 });
-        wait_for(&s, &gone, |st| *st == VtState::Error("okunamadı".into()));
+        wait_for(&s, &gone, |st| *st == VtState::Error("unreadable".into()));
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(s.state(&needs), VtState::Pending);
         assert_eq!(fake.calls(), 0);
@@ -719,10 +719,10 @@ mod tests {
         let s = svc(d.path(), &fake);
         let p = d.path().join("missing");
         s.enqueue(&p);
-        wait_for(&s, &p, |st| *st == VtState::Error("okunamadı".into()));
+        wait_for(&s, &p, |st| *st == VtState::Error("unreadable".into()));
         std::thread::sleep(Duration::from_millis(250));
         assert_eq!(fake.calls(), 0);
-        assert_eq!(s.state(&p), VtState::Error("okunamadı".into()));
+        assert_eq!(s.state(&p), VtState::Error("unreadable".into()));
     }
 
     #[test]

@@ -85,7 +85,7 @@ pub fn kill_tree_targets(live: &HashMap<Pid, ProcInfo>, root: Pid) -> Vec<(Pid, 
     descendants_postorder(live, root).iter().filter_map(|q| live.get(q)).map(|q| (q.pid, q.start_time)).collect()
 }
 
-const ADMIN_CANCELLED: &str = "Yönetici modu iptal edildi";
+const ADMIN_CANCELLED: &str = "Admin mode cancelled";
 
 /// prepare_dir → `launch` (blocks on the password prompt) → `connect`. On failure removes the temp
 /// dir and token itself: the client only cleans up once it exists.
@@ -93,7 +93,7 @@ fn elevate(
     launch: impl FnOnce(&Path) -> io::Result<()>,
     connect: impl FnOnce(&Path, &str) -> io::Result<HelperClient>,
 ) -> Result<HelperClient, String> {
-    let fail = |e: io::Error| format!("Yönetici modu başlatılamadı: {e}");
+    let fail = |e: io::Error| format!("Could not start admin mode: {e}");
     let (dir, token) = helper::prepare_dir().map_err(fail)?;
     // osascript reports a cancelled prompt only as a non-zero exit, so any launch error reads as cancel.
     let r = match launch(&dir) {
@@ -251,7 +251,7 @@ impl App {
         if self.admin && matches!(e, DetailError::Disconnected) {
             *self.backend.lock().unwrap() = Box::new(LocalBackend::new());
             self.admin = false;
-            self.status = Some("Yönetici bağlantısı koptu — normal moda dönüldü".into());
+            self.status = Some("Admin connection lost — back to normal mode".into());
         }
     }
 
@@ -267,15 +267,15 @@ impl App {
                 self.tree.reveal(pid, start, &self.live);
                 self.status = None;
             }
-            None => self.status = Some("Pencere bulunamadı".into()),
+            None => self.status = Some("No window found".into()),
         }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
         let (mut save, mut vt_changed) = (false, false);
-        egui::Window::new("Ayarlar").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
-            let r = ui.add(egui::Slider::new(&mut self.settings.interval_ms, 500..=5000).text("Yenileme aralığı").suffix(" ms"));
+        egui::Window::new("Settings").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            let r = ui.add(egui::Slider::new(&mut self.settings.interval_ms, 500..=5000).text("Refresh interval").suffix(" ms"));
             if r.changed() {
                 self.interval.store(self.settings.interval_ms, Ordering::Relaxed);
             }
@@ -284,10 +284,10 @@ impl App {
                 self.waker.wake();
             }
             ui.separator();
-            vt_changed |= ui.checkbox(&mut self.settings.vt_enabled, "VirusTotal kontrolü").changed();
-            ui.small("Yalnızca dosya özeti (SHA-256) gönderilir.");
+            vt_changed |= ui.checkbox(&mut self.settings.vt_enabled, "VirusTotal checks").changed();
+            ui.small("Only file hashes (SHA-256) are sent.");
             ui.horizontal(|ui| {
-                ui.label("API anahtarı");
+                ui.label("API key");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.settings.vt_api_key).password(true).desired_width(260.0));
                 self.key_dirty |= r.changed();
                 if r.lost_focus() && std::mem::take(&mut self.key_dirty) {
@@ -313,7 +313,7 @@ impl App {
 
     fn save_settings(&mut self) {
         if let Err(e) = self.settings.save(&self.settings_path) {
-            self.status = Some(format!("Ayarlar kaydedilemedi: {e}"));
+            self.status = Some(format!("Could not save settings: {e}"));
         }
     }
 
@@ -349,19 +349,19 @@ impl App {
                     return;
                 };
                 if tree && !tree_kill_allowed(pid) {
-                    self.status = Some("Bu süreç için ağaç sonlandırma devre dışı".into());
+                    self.status = Some("Kill process tree is disabled for this process".into());
                     return;
                 }
                 let targets = if tree { kill_tree_targets(&self.live, pid) } else { vec![(pid, p.start_time)] };
                 let text = if tree {
-                    format!("{} ({pid}) ve {} alt süreç sonlandırılsın mı?", p.name, targets.len() - 1)
+                    format!("Kill {} ({pid}) and {} child processes?", p.name, targets.len() - 1)
                 } else {
-                    format!("{} ({pid}) sonlandırılsın mı?", p.name)
+                    format!("Kill {} ({pid})?", p.name)
                 };
                 self.confirm = Some(Confirm { text, targets, sig });
             }
             Action::Signal { pid, sig: Sig::Stop, .. } if !pause_allowed(pid) => {
-                self.status = Some("Uygulama kendini duraklatamaz".into());
+                self.status = Some("The app can't suspend itself".into());
             }
             Action::Signal { pid, start, sig } => self.signal(&[(pid, start)], sig),
             Action::Nice { pid, start } => self.nice = Some(Nice { pid, start, value: 0 }),
@@ -395,8 +395,8 @@ impl App {
                 ui.label(&c.text);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    go = ui.button("Sonlandır").clicked();
-                    cancel = ui.button("Vazgeç").clicked();
+                    go = ui.button("Terminate").clicked();
+                    cancel = ui.button("Cancel").clicked();
                 });
             });
             if go {
@@ -409,11 +409,11 @@ impl App {
         if let Some(n) = &mut self.nice {
             let (mut go, mut cancel) = (false, false);
             let r = egui::Modal::new(egui::Id::new("nice")).show(ctx, |ui| {
-                ui.label(format!("Öncelik — {} ({})", self.view.get(&n.pid).map_or("?", |p| p.name.as_str()), n.pid));
+                ui.label(format!("Priority — {} ({})", self.view.get(&n.pid).map_or("?", |p| p.name.as_str()), n.pid));
                 ui.add(egui::Slider::new(&mut n.value, -20..=20));
                 ui.horizontal(|ui| {
                     go = ui.button("Uygula").clicked();
-                    cancel = ui.button("Vazgeç").clicked();
+                    cancel = ui.button("Cancel").clicked();
                 });
             });
             if go {
@@ -459,7 +459,7 @@ impl eframe::App for App {
         let got = self.admin_rx.as_ref().map(|rx| rx.try_recv());
         if let Some(r) = got.filter(|r| !matches!(r, Err(TryRecvError::Empty))) {
             self.admin_rx = None;
-            match r.unwrap_or_else(|_| Err("Yönetici modu başlatılamadı".into())) {
+            match r.unwrap_or_else(|_| Err("Could not start admin mode".into())) {
                 Ok(c) => {
                     *self.backend.lock().unwrap() = Box::new(c);
                     self.admin = true;
@@ -507,8 +507,8 @@ impl eframe::App for App {
             }
         }
         egui::Panel::bottom("status").show(ui, |ui| {
-            let text = if self.admin_rx.is_some() { Some("Yönetici modu bekleniyor…".to_string()) } else { self.status.clone() };
-            ui.label(text.unwrap_or_else(|| format!("{} süreç", self.live.len())));
+            let text = if self.admin_rx.is_some() { Some("Waiting for admin mode…".to_string()) } else { self.status.clone() };
+            ui.label(text.unwrap_or_else(|| format!("{} processes", self.live.len())));
         });
         let mut act = None;
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L)) {
@@ -596,7 +596,7 @@ mod tests {
             },
             |_, _| Err(io::ErrorKind::TimedOut.into()),
         );
-        assert!(r.err().unwrap().starts_with("Yönetici modu başlatılamadı"));
+        assert!(r.err().unwrap().starts_with("Could not start admin mode"));
         assert!(!seen.borrow().as_ref().unwrap().exists());
     }
 

@@ -86,7 +86,7 @@ fn row(ui: &mut egui::Ui, k: &str, v: impl Into<egui::WidgetText>) {
 
 fn extra_text<T>(e: &Option<Result<ProcExtra, DetailError>>, f: impl Fn(&ProcExtra) -> Option<T>, show: impl Fn(T) -> String) -> String {
     match e {
-        None => "Yükleniyor…".into(),
+        None => "Loading…".into(),
         Some(Err(err)) => err.to_string(),
         Some(Ok(x)) => f(x).map_or_else(|| "—".into(), show),
     }
@@ -143,7 +143,7 @@ impl Props {
                 .default_width(480.0)
                 .show(ctx, |ui| match live.get(&key.0).filter(|p| p.start_time == key.1) {
                     None => {
-                        ui.label("Süreç sonlandı");
+                        ui.label("Process exited");
                     }
                     Some(p) => body(ui, p, w, view, hist.get(&key), meta, &mut out),
                 });
@@ -155,13 +155,13 @@ impl Props {
 
 fn body(ui: &mut egui::Ui, p: &ProcInfo, w: &Win, view: &HashMap<Pid, ProcInfo>, hist: Option<&(Ring<f32>, Ring<u64>)>, meta: &MetaCache, out: &mut Out) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.heading("Genel");
+        ui.heading("General");
         egui::Grid::new("genel").num_columns(2).show(ui, |ui| {
-            row(ui, "Yol", p.exe.as_ref().map_or("—".into(), |e| e.to_string_lossy().into_owned()));
-            row(ui, "Komut satırı", extra_text(&w.extra, |x| Some(x.args.join(" ")), |s| s));
-            row(ui, "Çalışma klasörü", extra_text(&w.extra, |x| x.cwd.clone(), |s| s));
-            row(ui, "Başlama zamanı", local_time(p.start_time));
-            ui.label("Ebeveyn");
+            row(ui, "Path", p.exe.as_ref().map_or("—".into(), |e| e.to_string_lossy().into_owned()));
+            row(ui, "Command line", extra_text(&w.extra, |x| Some(x.args.join(" ")), |s| s));
+            row(ui, "Working directory", extra_text(&w.extra, |x| x.cwd.clone(), |s| s));
+            row(ui, "Started", local_time(p.start_time));
+            ui.label("Parent");
             match view.get(&p.ppid).filter(|q| q.pid != p.pid) {
                 Some(q) => {
                     if ui.link(format!("{} ({})", q.name, q.pid)).clicked() {
@@ -173,16 +173,16 @@ fn body(ui: &mut egui::Ui, p: &ProcInfo, w: &Win, view: &HashMap<Pid, ProcInfo>,
                 }
             }
             ui.end_row();
-            row(ui, "Kullanıcı", p.user.clone());
+            row(ui, "User", p.user.clone());
         });
-        if ui.add_enabled(p.exe.is_some(), egui::Button::new("Finder'da göster")).clicked() {
+        if ui.add_enabled(p.exe.is_some(), egui::Button::new("Reveal in Finder")).clicked() {
             out.reveal = p.exe.clone();
         }
         ui.separator();
-        ui.heading("Ortam");
+        ui.heading("Environment");
         match &w.extra {
             None => {
-                ui.label("Yükleniyor…");
+                ui.label("Loading…");
             }
             Some(Err(e)) => {
                 ui.label(e.to_string());
@@ -200,34 +200,34 @@ fn body(ui: &mut egui::Ui, p: &ProcInfo, w: &Win, view: &HashMap<Pid, ProcInfo>,
             }
         }
         ui.separator();
-        ui.heading("İmza");
+        ui.heading("Signature");
         let m = p.exe.as_deref().and_then(|e| meta.get(e));
         match m.as_deref() {
             None => {
-                ui.label(if p.exe.is_some() { "Yükleniyor…" } else { "—" });
+                ui.label(if p.exe.is_some() { "Loading…" } else { "—" });
             }
             Some(m) => match &m.signing {
                 None => {
-                    ui.label("İmzasız");
+                    ui.label("Unsigned");
                 }
                 Some(s) => {
                     let dash = |o: &Option<String>| o.clone().unwrap_or_else(|| "—".into());
                     egui::Grid::new("imza").num_columns(2).show(ui, |ui| {
-                        row(ui, "Geçerli", if s.valid { "Evet" } else { "Hayır" });
-                        row(ui, "İmzalayan", dash(&s.authority));
+                        row(ui, "Valid", if s.valid { "Yes" } else { "No" });
+                        row(ui, "Signed by", dash(&s.authority));
                         row(ui, "Team ID", dash(&s.team_id));
-                        row(ui, "Şirket", dash(&s.company));
+                        row(ui, "Company", dash(&s.company));
                     });
                 }
             },
         }
         ui.separator();
-        ui.heading("Performans");
+        ui.heading("Performance");
         if let Some((cpu, mem)) = hist {
             let c: Vec<f64> = cpu.iter().map(|&v| v as f64).collect();
             let m: Vec<f64> = mem.iter().map(|&v| v as f64).collect();
             graph(ui, "CPU %", &c, c.iter().cloned().fold(100.0, f64::max), Color32::from_rgb(90, 160, 255));
-            graph(ui, "Bellek", &m, m.iter().cloned().fold(1.0, f64::max), Color32::from_rgb(255, 170, 60));
+            graph(ui, "Memory", &m, m.iter().cloned().fold(1.0, f64::max), Color32::from_rgb(255, 170, 60));
         }
     });
 }

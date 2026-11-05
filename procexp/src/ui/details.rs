@@ -19,7 +19,7 @@ enum Tab {
     Net,
 }
 
-const TABS: [(Tab, &str); 4] = [(Tab::Files, "Dosyalar ve Soketler"), (Tab::Libs, "Kütüphaneler"), (Tab::Threads, "Thread'ler"), (Tab::Net, "Ağ")];
+const TABS: [(Tab, &str); 4] = [(Tab::Files, "Files & Sockets"), (Tab::Libs, "Libraries"), (Tab::Threads, "Threads"), (Tab::Net, "Network")];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -91,7 +91,7 @@ fn fd_cells(e: &FdEntry) -> [String; 3] {
             [fd.to_string(), "Soket".into(), format!("{} {local} → {remote} {state}", proto_name(proto))]
         }
         FdEntry::Pipe { fd } => [fd.to_string(), "Pipe".into(), "—".into()],
-        FdEntry::Other { fd, kind } => [fd.to_string(), "Diğer".into(), kind.clone()],
+        FdEntry::Other { fd, kind } => [fd.to_string(), "Other".into(), kind.clone()],
     }
 }
 
@@ -165,7 +165,7 @@ impl Details {
         let Some(key) = sel else {
             self.shown = None;
             self.result = None;
-            return msg(ui, "Süreç seçin");
+            return msg(ui, "Select a process");
         };
         if self.shown != Some((key, kind)) {
             self.shown = Some((key, kind));
@@ -181,17 +181,17 @@ impl Details {
             self.spawn(backend, ui.ctx(), key, kind);
         }
         match (&self.result, self.tab) {
-            (None, _) => msg(ui, "Yükleniyor…"),
+            (None, _) => msg(ui, "Loading…"),
             (Some(Err(e)), _) => msg(ui, &e.to_string()),
             (Some(Ok(Data::Fds(v))), Tab::Net) => {
                 let s: Vec<_> = v.iter().filter(|e| is_net(e)).map(net_cells).collect();
-                grid(ui, &["Protokol", "Yerel", "Uzak", "Durum"], s.len(), |i, c| s[i][c].clone());
+                grid(ui, &["Protocol", "Local", "Remote", "State"], s.len(), |i, c| s[i][c].clone());
             }
             (Some(Ok(Data::Fds(v))), _) => {
-                grid(ui, &["FD", "Tür", "Ayrıntı"], v.len(), |i, c| std::mem::take(&mut fd_cells(&v[i])[c]));
+                grid(ui, &["FD", "Type", "Detail"], v.len(), |i, c| std::mem::take(&mut fd_cells(&v[i])[c]));
             }
-            (Some(Ok(Data::Libs(v))), _) => grid(ui, &["Yol"], v.len(), |i, _| v[i].clone()),
-            (Some(Ok(Data::Threads(v))), _) => grid(ui, &["ID", "Ad", "CPU %", "Durum"], v.len(), |i, c| {
+            (Some(Ok(Data::Libs(v))), _) => grid(ui, &["Path"], v.len(), |i, _| v[i].clone()),
+            (Some(Ok(Data::Threads(v))), _) => grid(ui, &["ID", "Ad", "CPU %", "State"], v.len(), |i, c| {
                 let t = &v[i];
                 match c {
                     0 => t.id.to_string(),

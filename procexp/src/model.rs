@@ -112,9 +112,9 @@ pub enum DetailError {
 impl fmt::Display for DetailError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DetailError::AccessDenied => f.write_str("Erişim yok — Yönetici modunu açın"),
-            DetailError::NoSuchProcess => f.write_str("Süreç sonlandı"),
-            DetailError::Disconnected => f.write_str("Yönetici bağlantısı koptu"),
+            DetailError::AccessDenied => f.write_str("Access denied — turn on Admin mode"),
+            DetailError::NoSuchProcess => f.write_str("Process exited"),
+            DetailError::Disconnected => f.write_str("Admin connection lost"),
             DetailError::Other(s) => f.write_str(s),
         }
     }

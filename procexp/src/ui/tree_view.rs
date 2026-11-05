@@ -28,14 +28,14 @@ pub const ALL_COLUMNS: [Column; 9] = [
 
 pub fn title(c: Column) -> &'static str {
     match c {
-        Column::Name => "Süreç",
+        Column::Name => "Process",
         Column::Pid => "PID",
         Column::Cpu => "CPU %",
-        Column::Mem => "Bellek",
-        Column::Threads => "Thread",
-        Column::User => "Kullanıcı",
-        Column::Description => "Açıklama",
-        Column::Company => "Şirket",
+        Column::Mem => "Memory",
+        Column::Threads => "Threads",
+        Column::User => "User",
+        Column::Description => "Description",
+        Column::Company => "Company",
         Column::Vt => "VirusTotal",
     }
 }
@@ -177,30 +177,30 @@ fn vt_cell(s: Option<&VtState>) -> RichText {
 fn menu(ui: &mut egui::Ui, p: &ProcInfo, vt_on: bool) -> Option<Action> {
     let (pid, start) = (p.pid, p.start_time);
     let mut act = None;
-    if ui.button("Sonlandır").clicked() {
+    if ui.button("Terminate").clicked() {
         act = Some(Action::Kill { pid, sig: Sig::Term, tree: false });
     }
-    if ui.button("Zorla sonlandır").clicked() {
+    if ui.button("Force kill").clicked() {
         act = Some(Action::Kill { pid, sig: Sig::Kill, tree: false });
     }
-    if ui.add_enabled(super::tree_kill_allowed(pid), egui::Button::new("Ağacı sonlandır")).clicked() {
+    if ui.add_enabled(super::tree_kill_allowed(pid), egui::Button::new("Kill process tree")).clicked() {
         act = Some(Action::Kill { pid, sig: Sig::Kill, tree: true });
     }
-    let (label, sig) = if matches!(p.status, ProcStatus::Stopped) { ("Devam ettir", Sig::Cont) } else { ("Duraklat", Sig::Stop) };
+    let (label, sig) = if matches!(p.status, ProcStatus::Stopped) { ("Resume", Sig::Cont) } else { ("Suspend", Sig::Stop) };
     if ui.add_enabled(!matches!(sig, Sig::Stop) || super::pause_allowed(pid), egui::Button::new(label)).clicked() {
         act = Some(Action::Signal { pid, start, sig });
     }
-    if ui.button("Öncelik…").clicked() {
+    if ui.button("Priority…").clicked() {
         act = Some(Action::Nice { pid, start });
     }
     ui.separator();
-    if ui.add_enabled(p.exe.is_some(), egui::Button::new("Finder'da göster")).clicked() {
+    if ui.add_enabled(p.exe.is_some(), egui::Button::new("Reveal in Finder")).clicked() {
         act = p.exe.clone().map(Action::Reveal);
     }
-    if ui.button("Özellikler").clicked() {
+    if ui.button("Properties").clicked() {
         act = Some(Action::Properties { pid, start });
     }
-    if vt_on && ui.add_enabled(p.exe.is_some(), egui::Button::new("VirusTotal'da şimdi kontrol et")).clicked() {
+    if vt_on && ui.add_enabled(p.exe.is_some(), egui::Button::new("Check on VirusTotal now")).clicked() {
         act = p.exe.clone().map(Action::VtCheck);
     }
     act
@@ -394,7 +394,7 @@ impl TreeView {
                             }
                         }
                         None => {
-                            ui.add_enabled(false, Label::new("Süreç sonlandı"));
+                            ui.add_enabled(false, Label::new("Process exited"));
                         }
                     }
                 });
@@ -469,7 +469,7 @@ mod tests {
         let flagged = VtState::Done { malicious: 2, total: 70 };
         assert_eq!(vt_cell(Some(&flagged)), RichText::new("2/70").color(Color32::RED));
         assert_eq!(vt_cell(Some(&VtState::Done { malicious: 0, total: 70 })), RichText::new("0/70"));
-        assert_eq!(vt_cell(Some(&VtState::Pending)), RichText::new("bekliyor"));
+        assert_eq!(vt_cell(Some(&VtState::Pending)), RichText::new("pending"));
         assert_eq!(vt_cell(None), RichText::new("—"));
     }
 
