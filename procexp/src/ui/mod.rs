@@ -44,6 +44,12 @@ fn spawn_sampler(backend: SharedBackend, ctx: egui::Context, every: Duration) ->
     rx
 }
 
+/// Children first, root last; only pids in `live`, each with its own start time. Absent root → empty.
+pub fn kill_tree_targets(live: &HashMap<Pid, ProcInfo>, root: Pid) -> Vec<(Pid, u64)> {
+    // descendants_postorder returns [root] even when root is absent; the filter drops it.
+    descendants_postorder(live, root).iter().filter_map(|q| live.get(q)).map(|q| (q.pid, q.start_time)).collect()
+}
+
 struct Confirm {
     text: String,
     targets: Vec<(Pid, u64)>,
@@ -110,11 +116,17 @@ impl App {
         self.view.get(&pid).map_or_else(|| "?".into(), |p| p.name.clone())
     }
 
-    /// Signals each target in order; reports the first failure.
+    /// Signals every target (root last); reports the first failure, ignoring descendants that already exited.
     fn signal(&mut self, targets: &[(Pid, u64)], sig: Sig) {
         let mut be = self.backend.lock().unwrap();
-        let err = targets.iter().find_map(|&(pid, start)| be.signal(pid, start, sig.clone()).err().map(|e| (pid, e)));
+        let errs: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(pid, start))| be.signal(pid, start, sig.clone()).err().map(|e| (i, pid, e)))
+            .collect();
         drop(be);
+        let root = targets.len().saturating_sub(1);
+        let err = errs.into_iter().find(|(i, _, e)| *i == root || !matches!(e, DetailError::NoSuchProcess)).map(|(_, pid, e)| (pid, e));
         self.status = err.map(|(pid, e)| format!("{} ({pid}): {e}", self.name(pid)));
     }
 
@@ -126,9 +138,7 @@ impl App {
                     self.status = Some(format!("{} ({pid}): {}", self.name(pid), DetailError::NoSuchProcess));
                     return;
                 };
-                // descendants_postorder always ends with the root; signal only pids in this snapshot.
-                let pids = if tree { descendants_postorder(&self.live, pid) } else { vec![pid] };
-                let targets: Vec<_> = pids.iter().filter_map(|q| self.live.get(q)).map(|q| (q.pid, q.start_time)).collect();
+                let targets = if tree { kill_tree_targets(&self.live, pid) } else { vec![(pid, p.start_time)] };
                 let text = if tree {
                     format!("{} ({pid}) ve {} alt süreç sonlandırılsın mı?", p.name, targets.len() - 1)
                 } else {
@@ -238,6 +248,7 @@ impl eframe::App for App {
                     query: &self.query,
                     flat: self.settings.flat,
                     load_meta: !minimized,
+                    modal_open: self.confirm.is_some() || self.nice.is_some(),
                 },
             );
         });
@@ -245,5 +256,39 @@ impl eframe::App for App {
             self.handle(a);
         }
         self.dialogs(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ProcStatus;
+
+    fn p(pid: Pid, ppid: Pid, start: u64) -> ProcInfo {
+        ProcInfo {
+            pid,
+            ppid,
+            name: "x".into(),
+            exe: None,
+            user: "u".into(),
+            uid: 501,
+            cpu: 0.0,
+            mem: 0,
+            threads: None,
+            status: ProcStatus::Running,
+            start_time: start,
+            disk_read: 0,
+            disk_write: 0,
+        }
+    }
+
+    #[test]
+    fn tree_kill_targets_only_live_with_own_start_time() {
+        let live: HashMap<Pid, ProcInfo> = [p(10, 1, 100), p(11, 10, 111), p(12, 11, 122), p(13, 10, 133)]
+            .into_iter()
+            .map(|x| (x.pid, x))
+            .collect();
+        assert_eq!(kill_tree_targets(&live, 10), [(12, 122), (11, 111), (13, 133), (10, 100)]);
+        assert!(kill_tree_targets(&live, 999).is_empty());
     }
 }

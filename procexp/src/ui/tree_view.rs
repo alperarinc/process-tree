@@ -100,10 +100,14 @@ pub struct View<'a> {
     pub flat: bool,
     /// False while minimized: no metadata or icon requests.
     pub load_meta: bool,
+    /// A confirmation/Öncelik dialog is open: keys must not retarget it.
+    pub modal_open: bool,
 }
 
 pub struct TreeView {
     pub selected: Option<(Pid, u64)>,
+    /// Process the open context menu acts on; fixed at right-click (the popup itself is bound to a row index).
+    menu_target: Option<(Pid, u64)>,
     collapsed: HashSet<Pid>,
     sort: Column,
     desc: bool,
@@ -113,7 +117,7 @@ pub struct TreeView {
 
 impl Default for TreeView {
     fn default() -> Self {
-        Self { selected: None, collapsed: HashSet::new(), sort: Column::Pid, desc: false, scroll_to: None, icons: HashMap::new() }
+        Self { selected: None, menu_target: None, collapsed: HashSet::new(), sort: Column::Pid, desc: false, scroll_to: None, icons: HashMap::new() }
     }
 }
 
@@ -185,7 +189,7 @@ fn menu(ui: &mut egui::Ui, p: &ProcInfo) -> Option<Action> {
 
 impl TreeView {
     pub fn show(&mut self, ui: &mut egui::Ui, v: &View) -> Option<Action> {
-        let Self { selected, collapsed, sort, desc, scroll_to, icons } = self;
+        let Self { selected, menu_target, collapsed, sort, desc, scroll_to, icons } = self;
         let meta_of = |p: &ProcInfo| -> Option<Arc<Meta>> {
             if !v.load_meta {
                 return None;
@@ -201,7 +205,7 @@ impl TreeView {
         let mut act = None;
         let mut new_idx = None;
         let mut toggle = None;
-        if !ui.ctx().egui_wants_keyboard_input() && !rows.is_empty() {
+        if !v.modal_open && !ui.ctx().egui_wants_keyboard_input() && !rows.is_empty() {
             let last = rows.len() - 1;
             let cur = sel_idx.unwrap_or(0);
             ui.input(|i| {
@@ -305,7 +309,7 @@ impl TreeView {
                                 .entry(exe.clone())
                                 .or_insert_with(|| {
                                     let px = m.icon.as_ref().filter(|b| b.len() == 32 * 32 * 4)?;
-                                    let img = egui::ColorImage::from_rgba_premultiplied([32, 32], px);
+                                    let img = egui::ColorImage::from_rgba_unmultiplied([32, 32], px);
                                     Some(ui.ctx().load_texture(exe.to_string_lossy(), img, egui::TextureOptions::LINEAR))
                                 })
                                 .clone()
@@ -323,9 +327,22 @@ impl TreeView {
                 if resp.clicked() || resp.secondary_clicked() {
                     *selected = Some((p.pid, p.start_time));
                 }
+                if resp.secondary_clicked() {
+                    *menu_target = Some((p.pid, p.start_time));
+                }
                 resp.context_menu(|ui| {
-                    if let Some(a) = menu(ui, p) {
-                        act = Some(a);
+                    let target = menu_target
+                        .and_then(|(pid, start)| v.procs.get(&pid).filter(|t| t.start_time == start))
+                        .filter(|t| v.tracker.life(t.pid) != Life::Exited);
+                    match target {
+                        Some(t) => {
+                            if let Some(a) = menu(ui, t) {
+                                act = Some(a);
+                            }
+                        }
+                        None => {
+                            ui.add_enabled(false, Label::new("Süreç sonlandı"));
+                        }
                     }
                 });
             });
