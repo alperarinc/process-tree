@@ -216,3 +216,82 @@ mod sampler {
         assert!(avg < Duration::from_millis(30), "avg={avg:?}");
     }
 }
+
+mod actions {
+    use procexp::actions::*;
+    use procexp::darwin::libproc::start_time;
+    use procexp::model::*;
+    use procexp::sampler::LocalSampler;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, Command};
+
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn spawn() -> (Guard, Pid, u64) {
+        let c = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = c.id() as Pid;
+        let st = start_time(pid).unwrap();
+        (Guard(c), pid, st)
+    }
+    fn ps(pid: Pid, col: &str) -> String {
+        let o = Command::new("ps").env("LC_ALL", "C").args(["-o", &format!("{col}="), "-p", &pid.to_string()]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+    fn wait_for(f: impl Fn() -> bool) -> bool {
+        for _ in 0..50 {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn stop_cont_kill_child() {
+        let (mut g, pid, st) = spawn();
+        send_signal(pid, st, Sig::Stop).unwrap();
+        assert!(wait_for(|| ps(pid, "stat").starts_with('T')));
+        send_signal(pid, st, Sig::Cont).unwrap();
+        assert!(wait_for(|| !ps(pid, "stat").starts_with('T')));
+        send_signal(pid, st, Sig::Kill).unwrap();
+        assert_eq!(g.0.wait().unwrap().signal(), Some(9));
+    }
+
+    #[test]
+    fn signal_refuses_mismatched_start_time() {
+        let (mut g, pid, st) = spawn();
+        assert!(matches!(send_signal(pid, st + 1, Sig::Kill), Err(DetailError::NoSuchProcess)));
+        assert!(g.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn renice_child_up() {
+        let (_g, pid, st) = spawn();
+        renice(pid, st, 10).unwrap();
+        assert_eq!(ps(pid, "nice"), "10");
+        assert!(matches!(renice(pid, st + 1, 5), Err(DetailError::NoSuchProcess)));
+    }
+
+    #[test]
+    fn renice_down_without_root_is_access_denied() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_g, pid, st) = spawn();
+        renice(pid, st, 10).unwrap();
+        assert!(matches!(renice(pid, st, 0), Err(DetailError::AccessDenied)));
+    }
+
+    #[test]
+    fn sampler_start_time_matches_libproc() {
+        let (_g, pid, st) = spawn();
+        let snap = LocalSampler::new().sample();
+        assert_eq!(snap.procs[&pid].start_time, st);
+    }
+}
