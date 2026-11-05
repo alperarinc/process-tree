@@ -11,5 +11,8 @@ fn main() {
         };
         std::process::exit(code);
     }
-    // GUI: Task 10
+    if let Err(e) = procexp::ui::run() {
+        eprintln!("procexp: {e}");
+        std::process::exit(1);
+    }
 }
