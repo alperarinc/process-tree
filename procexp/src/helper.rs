@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -59,26 +59,72 @@ pub fn prepare_dir() -> io::Result<(PathBuf, String)> {
     Ok((dir, token))
 }
 
+extern "C" {
+    // Per-thread cwd (libsystem_pthread, macOS 10.12+, no public header). -1 reverts to the
+    // process cwd. Stands in for bindat(), which macOS does not export.
+    fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+}
+
+fn cvt(rc: libc::c_int) -> io::Result<libc::c_int> {
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
 /// Serves exactly one authenticated client, then returns. Runs as root in production.
+/// The dir is user-owned, so it is opened once (no symlinks) and everything else is done
+/// relative to that fd: the user cannot swap paths under us.
 pub fn run_server(dir: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(dir)?;
-    if !meta.is_dir() || meta.mode() & 0o077 != 0 {
-        return Err(io::Error::other("helper dir must be a private directory"));
+    let d = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let meta = d.metadata()?; // fstat
+    if !meta.is_dir() || meta.mode() & 0o077 != 0 || meta.uid() == 0 {
+        return Err(io::Error::other(
+            "helper dir must be a private user directory",
+        ));
     }
     let owner = meta.uid();
-    let token_path = dir.join("token");
-    let token = fs::read_to_string(&token_path)?;
-    fs::remove_file(&token_path)?;
-    let sock = dir.join("sock");
+    let dfd = d.as_raw_fd();
+    let token = read_token(dfd)?;
+    cvt(unsafe { libc::unlinkat(dfd, c"token".as_ptr(), 0) })?;
+    let listener = bind_sock(dfd)?;
+    let r = accept(&listener).and_then(|s| serve(s, owner, token.trim()));
+    unsafe { libc::unlinkat(dfd, c"sock".as_ptr(), 0) };
+    r
+}
+
+/// Opens `token` without following symlinks or blocking on a FIFO; regular file, at most 65 bytes.
+fn read_token(dfd: libc::c_int) -> io::Result<String> {
+    let fd = cvt(unsafe {
+        libc::openat(
+            dfd,
+            c"token".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    })?;
+    let f = unsafe { fs::File::from_raw_fd(fd) };
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("token is not a regular file"));
+    }
+    let mut token = String::new();
+    f.take(65).read_to_string(&mut token)?;
+    Ok(token)
+}
+
+/// Binds `sock` inside the already-checked dir fd (relative to this thread's cwd).
+fn bind_sock(dfd: libc::c_int) -> io::Result<UnixListener> {
+    cvt(unsafe { pthread_fchdir_np(dfd) })?;
     // Socket must be connectable by the (non-root) owner; the 0700 dir already restricts access.
     // umask instead of chown/chmod-by-path: nothing to race with a swapped-in symlink.
     let old = unsafe { libc::umask(0) };
-    let listener = UnixListener::bind(&sock);
+    let l = UnixListener::bind("sock");
     unsafe { libc::umask(old) };
-    let listener = listener?;
-    let r = accept(&listener).and_then(|s| serve(s, owner, token.trim()));
-    let _ = fs::remove_file(&sock);
-    r
+    cvt(unsafe { pthread_fchdir_np(-1) })?;
+    l
 }
 
 fn accept(l: &UnixListener) -> io::Result<UnixStream> {
@@ -196,10 +242,22 @@ pub fn launch(exe: &Path, dir: &Path) -> io::Result<()> {
 /// `Backend` over the helper socket. After any I/O or protocol error it stays `Disconnected`.
 pub struct HelperClient {
     conn: Option<(BufReader<UnixStream>, UnixStream)>,
+    dir: PathBuf,
 }
 
 impl HelperClient {
+    /// Connects to the root helper; refuses a server not running as root.
     pub fn connect(dir: &Path, token: &str, timeout: Duration) -> io::Result<Self> {
+        Self::connect_expecting(dir, token, timeout, 0)
+    }
+
+    /// Like `connect`, but the server must run as `uid` (tests run it as the current user).
+    pub fn connect_expecting(
+        dir: &Path,
+        token: &str,
+        timeout: Duration,
+        uid: u32,
+    ) -> io::Result<Self> {
         let sock = dir.join("sock");
         let deadline = Instant::now() + timeout;
         let mut s = loop {
@@ -209,11 +267,29 @@ impl HelperClient {
                 Err(_) => thread::sleep(Duration::from_millis(50)),
             }
         };
+        // Check the peer before the token leaves this process.
+        let (mut peer, mut gid) = (0, 0);
+        cvt(unsafe { libc::getpeereid(s.as_raw_fd(), &mut peer, &mut gid) })?;
+        if peer != uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("helper runs as uid {peer}, expected {uid}"),
+            ));
+        }
         s.write_all(format!("{token}\n").as_bytes())?;
         s.set_read_timeout(Some(REPLY_TIMEOUT))?;
         Ok(Self {
             conn: Some((BufReader::new(s.try_clone()?), s)),
+            dir: dir.to_path_buf(),
         })
+    }
+
+    /// Best-effort: drop the connection and remove our temp dir (the helper never comes back).
+    fn close(&mut self) {
+        if self.conn.take().is_some() {
+            let _ = fs::remove_file(self.dir.join("sock"));
+            let _ = fs::remove_dir(&self.dir);
+        }
     }
 
     fn call(&mut self, req: &Request) -> Result<Response, DetailError> {
@@ -238,8 +314,14 @@ impl HelperClient {
     }
 
     fn dead<T>(&mut self) -> Result<T, DetailError> {
-        self.conn = None;
+        self.close();
         Err(DetailError::Disconnected)
+    }
+}
+
+impl Drop for HelperClient {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -326,10 +408,64 @@ mod tests {
         std::process::id() as Pid
     }
 
+    /// Test servers run as us, not root.
+    fn connect(dir: &Path, token: &str, t: Duration) -> io::Result<HelperClient> {
+        HelperClient::connect_expecting(dir, token, t, unsafe { libc::getuid() })
+    }
+
+    #[test]
+    fn client_refuses_non_root_server() {
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+        let (dir, token, rx) = start();
+        let e = HelperClient::connect(&dir.0, &token, T)
+            .err()
+            .expect("must refuse");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        // Token never sent: the server sees EOF instead and rejects.
+        assert!(rx.recv_timeout(SEC).unwrap().is_err());
+    }
+
+    #[test]
+    fn client_drop_removes_dir() {
+        let (dir, token, rx) = start();
+        let c = connect(&dir.0, &token, T).unwrap();
+        drop(c);
+        assert!(!dir.0.exists());
+        // Server may not have accepted yet (then getpeereid fails): it must still exit.
+        let _ = rx.recv_timeout(SEC).unwrap();
+    }
+
+    #[test]
+    fn swapped_paths_are_refused() {
+        use std::os::unix::fs::symlink;
+        // token as symlink to a readable file
+        let (dir, _) = prepare_dir().unwrap();
+        let dir = Dir(dir);
+        fs::remove_file(dir.0.join("token")).unwrap();
+        symlink("/etc/hosts", dir.0.join("token")).unwrap();
+        assert!(run_server(&dir.0).is_err());
+        // token as FIFO: must not block
+        fs::remove_file(dir.0.join("token")).unwrap();
+        let c = std::ffi::CString::new(dir.0.join("token").into_os_string().into_encoded_bytes())
+            .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let rx = spawn_server(&dir.0);
+        assert!(rx.recv_timeout(SEC).unwrap().is_err());
+        // dir itself as symlink to a valid helper dir
+        let (real, _) = prepare_dir().unwrap();
+        let real = Dir(real);
+        let link = Dir(real.0.with_extension("link"));
+        symlink(&real.0, &link.0).unwrap();
+        assert!(run_server(&link.0).is_err());
+        assert!(real.0.join("token").exists());
+    }
+
     #[test]
     fn client_samples_through_server() {
         let (dir, token, _rx) = start();
-        let mut c = HelperClient::connect(&dir.0, &token, T).unwrap();
+        let mut c = connect(&dir.0, &token, T).unwrap();
         let snap = c.sample().unwrap();
         assert!(snap.procs.contains_key(&me()));
         assert!(!c.threads(me()).unwrap().is_empty());
@@ -342,7 +478,7 @@ mod tests {
     #[test]
     fn wrong_token_is_rejected() {
         let (dir, _token, rx) = start();
-        let mut c = HelperClient::connect(&dir.0, "nope", T).unwrap();
+        let mut c = connect(&dir.0, "nope", T).unwrap();
         assert!(matches!(c.sample(), Err(DetailError::Disconnected)));
         assert!(rx.recv_timeout(SEC).unwrap().is_err());
     }
@@ -359,7 +495,7 @@ mod tests {
             BufReader::new(&s).read_line(&mut line).unwrap();
             line
         });
-        let mut c = HelperClient::connect(&dir.0, &token, T).unwrap();
+        let mut c = connect(&dir.0, &token, T).unwrap();
         assert_eq!(h.join().unwrap().trim_end(), token);
         let t = Instant::now();
         assert!(matches!(c.sample(), Err(DetailError::Disconnected)));
@@ -370,7 +506,7 @@ mod tests {
     #[test]
     fn server_exits_when_client_drops() {
         let (dir, token, rx) = start();
-        let mut c = HelperClient::connect(&dir.0, &token, T).unwrap();
+        let mut c = connect(&dir.0, &token, T).unwrap();
         c.proc_extra(me()).unwrap();
         drop(c);
         rx.recv_timeout(SEC).unwrap().unwrap();
@@ -386,7 +522,7 @@ mod tests {
         assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(mode(&dir.0.join("token")), 0o600);
         let _rx = spawn_server(&dir.0);
-        let _c = HelperClient::connect(&dir.0, &token, T).unwrap();
+        let _c = connect(&dir.0, &token, T).unwrap();
         assert!(!dir.0.join("token").exists());
         assert_eq!(mode(&dir.0), 0o700);
         assert_ne!(prepare_dir().map(|(d, t)| (Dir(d), t)).unwrap().1, token);
