@@ -87,6 +87,7 @@ pub enum Action {
     Signal { pid: Pid, start: u64, sig: Sig },
     Nice { pid: Pid, start: u64 },
     Reveal(PathBuf),
+    Properties { pid: Pid, start: u64 },
     ToggleColumn(Column),
 }
 
@@ -182,8 +183,9 @@ fn menu(ui: &mut egui::Ui, p: &ProcInfo) -> Option<Action> {
     if ui.add_enabled(p.exe.is_some(), egui::Button::new("Finder'da göster")).clicked() {
         act = p.exe.clone().map(Action::Reveal);
     }
-    // Properties window arrives in Task 11; VirusTotal item in Task 12.
-    ui.add_enabled(false, egui::Button::new("Özellikler"));
+    if ui.button("Özellikler").clicked() {
+        act = Some(Action::Properties { pid, start });
+    }
     act
 }
 
@@ -229,6 +231,9 @@ impl TreeView {
                     let folded = collapsed.contains(&r.pid);
                     if r.has_children && ((i.key_pressed(Key::ArrowLeft) && !folded) || (i.key_pressed(Key::ArrowRight) && folded)) {
                         toggle = Some(r.pid);
+                    }
+                    if i.key_pressed(Key::Enter) {
+                        act = Some(Action::Properties { pid: r.pid, start: start_of(r.pid) });
                     }
                     if i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace) {
                         act = Some(Action::Kill { pid: r.pid, sig: Sig::Term, tree: false });
@@ -326,6 +331,9 @@ impl TreeView {
                 let resp = row.response();
                 if resp.clicked() || resp.secondary_clicked() {
                     *selected = Some((p.pid, p.start_time));
+                }
+                if resp.double_clicked() {
+                    act = Some(Action::Properties { pid: p.pid, start: p.start_time });
                 }
                 if resp.secondary_clicked() {
                     *menu_target = Some((p.pid, p.start_time));

@@ -1,4 +1,6 @@
 //! eframe app: sampler thread, toolbar, process table, confirmation dialogs, status bar.
+pub mod details;
+pub mod properties;
 pub mod toolbar;
 pub mod tree_view;
 
@@ -79,6 +81,10 @@ struct App {
     status: Option<String>,
     confirm: Option<Confirm>,
     nice: Option<Nice>,
+    ctx: egui::Context,
+    details: details::Details,
+    props: properties::Props,
+    proc_hist: properties::ProcHistory,
 }
 
 impl App {
@@ -103,6 +109,10 @@ impl App {
             status: None,
             confirm: None,
             nice: None,
+            ctx: ctx.clone(),
+            details: Default::default(),
+            props: Default::default(),
+            proc_hist: Default::default(),
         }
     }
 
@@ -148,6 +158,12 @@ impl App {
             }
             Action::Signal { pid, start, sig } => self.signal(&[(pid, start)], sig),
             Action::Nice { pid, start } => self.nice = Some(Nice { pid, start, value: 0 }),
+            Action::Properties { pid, start } => {
+                if let Some(p) = self.view.get(&pid).filter(|p| p.start_time == start) {
+                    let name = p.name.clone();
+                    self.props.open(&self.backend, &self.ctx, (pid, start), name);
+                }
+            }
             Action::Reveal(path) => {
                 if let Err(e) = actions::reveal_in_finder(&path) {
                     self.status = Some(e.to_string());
@@ -218,6 +234,7 @@ impl eframe::App for App {
                     for g in self.tracker.ghosts() {
                         self.view.entry(g.pid).or_insert(g);
                     }
+                    properties::record(&mut self.proc_hist, &snap.procs, &self.view);
                     self.live = snap.procs;
                 }
                 Err(e) => self.status = Some(e.to_string()),
@@ -237,6 +254,15 @@ impl eframe::App for App {
             ui.label(self.status.clone().unwrap_or_else(|| format!("{} süreç", self.live.len())));
         });
         let mut act = None;
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L)) {
+            self.details.toggle();
+        }
+        if self.details.visible {
+            let every = Duration::from_millis(self.settings.interval_ms);
+            egui::Panel::bottom("details").resizable(true).default_size(220.0).show(ui, |ui| {
+                self.details.show(ui, &self.backend, &self.live, self.tree.selected, every);
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             act = self.tree.show(
                 ui,
@@ -254,6 +280,13 @@ impl eframe::App for App {
         });
         if let Some(a) = act {
             self.handle(a);
+        }
+        let out = self.props.show(&ctx, &self.live, &self.view, &self.proc_hist, &self.meta);
+        if out.select.is_some() {
+            self.tree.selected = out.select;
+        }
+        if let Some(p) = out.reveal {
+            self.handle(Action::Reveal(p));
         }
         self.dialogs(&ctx);
     }
