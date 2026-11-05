@@ -73,13 +73,6 @@ impl RateLimiter {
         Self { per_min, per_day, recent: VecDeque::new(), day: 0, day_count: 0 }
     }
 
-    /// Whether `try_take` would succeed right now; consumes nothing.
-    pub fn can_take(&self, now_unix: u64) -> bool {
-        let recent = self.recent.iter().filter(|&&t| t + 60 > now_unix).count() as u32;
-        let day_count = if now_unix / 86_400 == self.day { self.day_count } else { 0 };
-        recent < self.per_min && day_count < self.per_day
-    }
-
     pub fn try_take(&mut self, now_unix: u64) -> bool {
         while self.recent.front().is_some_and(|&t| t + 60 <= now_unix) {
             self.recent.pop_front();
@@ -292,6 +285,8 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
     crate::darwin::set_background_qos();
     let mut file_sha: HashMap<PathBuf, (SystemTime, u64, String)> = HashMap::new();
     let mut g = sh.inner.lock().unwrap();
+    // Items that need quota while the limiter is full; skipped until the next poll.
+    let mut blocked: std::collections::HashSet<PathBuf> = Default::default();
     loop {
         if g.stop {
             return;
@@ -307,6 +302,9 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
         } else {
             g.paused_until = None;
             for (i, p) in g.queue.iter().enumerate() {
+                if blocked.contains(p) {
+                    continue;
+                }
                 match g.retry_at.get(p) {
                     Some(&t) if t > now => wait = Some(wait.map_or(t - now, |w| w.min(t - now))),
                     _ => {
@@ -317,22 +315,21 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
             }
         }
         let Some(i) = pick else {
+            if !blocked.is_empty() {
+                wait = Some(wait.map_or(cfg.poll, |w| w.min(cfg.poll)));
+            }
+            let had_blocked = !blocked.is_empty();
             g = match wait {
                 Some(w) => sh.cv.wait_timeout(g, w).unwrap().0,
                 None => sh.cv.wait(g).unwrap(),
             };
+            if had_blocked {
+                blocked.clear();
+            }
             continue;
         };
-        // Quota exhausted: stay silent (no state flip, no repaint) until it frees up.
-        if !g.limiter.can_take((cfg.now_unix)()) {
-            g.paused_until = Some(Instant::now() + cfg.poll);
-            continue;
-        }
         let path = g.queue[i].clone();
-        g.retry_at.remove(&path);
-        g.states.insert(path.clone(), VtState::Querying);
         drop(g);
-        repaint();
 
         // Hash outside the lock; unchanged files (path, mtime, size) are not rehashed.
         let hashed = match std::fs::metadata(&path).and_then(|m| Ok((m.modified()?, m.len()))) {
@@ -367,12 +364,17 @@ fn worker(sh: Arc<Shared>, cache_path: PathBuf, http: Box<dyn VtHttp>, repaint: 
             g = sh.inner.lock().unwrap();
             continue;
         }
+        // Only a real HTTP call costs quota; cache hits and unreadable files resolved above.
+        // While full, stay silent (no state flip, no repaint) and let later items resolve.
         if !g.limiter.try_take((cfg.now_unix)()) {
-            g.states.insert(path, VtState::Pending);
+            blocked.insert(path);
             continue;
         }
+        g.retry_at.remove(&path);
+        g.states.insert(path.clone(), VtState::Querying);
         let key = g.key.clone();
         drop(g);
+        repaint();
         let resp = http.get(&sha, &key);
         g = sh.inner.lock().unwrap();
 
@@ -666,6 +668,27 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(s.state(&a), VtState::Pending);
         assert_eq!((fake.calls(), n.load(std::sync::atomic::Ordering::SeqCst)), (0, 0));
+    }
+
+    #[test]
+    fn cached_and_unreadable_resolve_while_quota_exhausted() {
+        let d = tempfile::tempdir().unwrap();
+        let (needs, cached, gone) = (file(d.path(), "n", "new"), file(d.path(), "c", "old"), d.path().join("gone"));
+        // Seed a cached result for "old" (sha computed the same way the worker does).
+        let sha = hash_file(&cached).unwrap().0;
+        let cache = DiskCache { day: 1_000_000 / 86_400, day_count: 500, results: [(sha, Some((1, 5)))].into() };
+        std::fs::write(d.path().join("vt-cache.json"), serde_json::to_vec(&cache).unwrap()).unwrap();
+        let cfg = VtConfig { now_unix: Box::new(|| 1_000_000), ..fast() };
+        let fake = Fake::default();
+        let s = VtService::with_config(d.path().join("vt-cache.json"), Box::new(fake.clone()), "k".into(), Box::new(|| {}), cfg);
+        s.enqueue(&needs); // head item needs quota and must not block the others
+        s.enqueue(&cached);
+        s.enqueue(&gone);
+        assert_eq!(wait_for(&s, &cached, done), VtState::Done { malicious: 1, total: 5 });
+        wait_for(&s, &gone, |st| *st == VtState::Error("okunamadı".into()));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(s.state(&needs), VtState::Pending);
+        assert_eq!(fake.calls(), 0);
     }
 
     #[test]
