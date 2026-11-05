@@ -6,6 +6,10 @@ use std::io;
 use std::path::Path;
 
 fn check(pid: Pid, expected_start: u64) -> Result<(), DetailError> {
+    // kill(0)/kill(-1) would signal a whole process group / every process; setpriority(0) is self.
+    if pid <= 0 {
+        return Err(DetailError::NoSuchProcess);
+    }
     if start_time(pid)? == expected_start { Ok(()) } else { Err(DetailError::NoSuchProcess) }
 }
 

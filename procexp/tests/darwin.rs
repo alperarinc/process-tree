@@ -271,6 +271,16 @@ mod actions {
     }
 
     #[test]
+    fn nonpositive_pid_is_rejected() {
+        // Cont is harmless if the guard were missing: kill(0)/kill(-1) would hit our group / everything.
+        for pid in [0, -1] {
+            let st = start_time(pid).unwrap_or(0);
+            assert!(matches!(send_signal(pid, st, Sig::Cont), Err(DetailError::NoSuchProcess)), "pid {pid}");
+            assert!(matches!(renice(pid, st, 10), Err(DetailError::NoSuchProcess)), "pid {pid}");
+        }
+    }
+
+    #[test]
     fn renice_child_up() {
         let (_g, pid, st) = spawn();
         renice(pid, st, 10).unwrap();
