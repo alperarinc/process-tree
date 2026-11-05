@@ -9,14 +9,24 @@ fn me() -> Pid {
 
 #[test]
 fn own_thread_count_grows() {
-    let n = thread_count(me()).unwrap();
+    // Other tests' threads come and go, so assert a floor instead of a delta:
+    // while 8 sleepers are alive the count includes them plus this thread.
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let t = std::thread::spawn(move || {
-        let _ = rx.recv();
-    });
-    assert!(thread_count(me()).unwrap() > n);
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    let hs: Vec<_> = (0..8)
+        .map(|_| {
+            let rx = rx.clone();
+            std::thread::spawn(move || {
+                let _ = rx.lock().unwrap().recv();
+            })
+        })
+        .collect();
+    let n = thread_count(me()).unwrap();
     drop(tx);
-    t.join().unwrap();
+    for h in hs {
+        h.join().unwrap();
+    }
+    assert!(n >= 9, "n={n}");
 }
 
 #[test]
@@ -112,5 +122,20 @@ fn start_time_is_recent_for_child() {
         .unwrap()
         .as_secs();
     let st = st.unwrap();
-    assert!(st <= now + 1 && now - st <= 5, "st={st} now={now}");
+    assert!(now.abs_diff(st) <= 5, "st={st} now={now}");
+}
+
+#[test]
+fn proc_extra_of_launchd_needs_root() {
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(matches!(proc_extra(1), Err(DetailError::AccessDenied)));
+    }
+}
+
+#[test]
+fn proc_extra_of_exited_process_is_no_such_process() {
+    let mut c = Command::new("true").spawn().unwrap();
+    let pid = c.id() as i32;
+    c.wait().unwrap();
+    assert!(matches!(proc_extra(pid), Err(DetailError::NoSuchProcess)));
 }

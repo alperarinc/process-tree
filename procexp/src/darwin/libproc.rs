@@ -240,6 +240,18 @@ pub fn mapped_files(pid: Pid) -> Result<Vec<String>, DetailError> {
     Ok(paths.into_iter().collect())
 }
 
+/// KERN_PROCARGS2 reports EINVAL for both denied and exited pids; a libproc probe tells them apart.
+fn procargs_err(pid: Pid) -> DetailError {
+    let e = last_err();
+    if matches!(&e, DetailError::Other(_)) && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        return match start_time(pid) {
+            Err(probe) => probe,
+            Ok(_) => e,
+        };
+    }
+    e
+}
+
 fn procargs(pid: Pid) -> Result<ProcExtra, DetailError> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut len = 0usize;
@@ -247,12 +259,12 @@ fn procargs(pid: Pid) -> Result<ProcExtra, DetailError> {
         libc::sysctl(mib.as_mut_ptr(), 3, buf, len, std::ptr::null_mut(), 0)
     };
     if call(std::ptr::null_mut(), &mut len, &mut mib) != 0 {
-        return Err(last_err());
+        return Err(procargs_err(pid));
     }
     len += 4096; // args may grow between the two calls
     let mut b = vec![0u8; len];
     if call(b.as_mut_ptr().cast(), &mut len, &mut mib) != 0 {
-        return Err(last_err());
+        return Err(procargs_err(pid));
     }
     b.truncate(len);
     if b.len() < 4 {
