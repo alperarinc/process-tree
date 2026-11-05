@@ -3,7 +3,7 @@
 # shortcut: Terminal penceresinde çalışır, native pencere değil; gerekirse PyObjC/SwiftUI ile yeniden yazılır.
 set -e
 cd "$(dirname "$0")"
-APP="$HOME/Applications/Process Tree.app"
+APP="$HOME/Applications/Process Tree (Terminal).app"
 mkdir -p "$HOME/Applications"
 rm -rf "$APP"
 osacompile -o "$APP" -e '

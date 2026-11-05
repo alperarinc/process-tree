@@ -429,6 +429,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        // Unfocused: sample at least every 3 s, to stay under the 2 % background CPU budget.
+        let focused = ctx.input(|i| i.focused);
+        let want = if focused { self.settings.interval_ms } else { self.settings.interval_ms.max(3000) };
+        self.interval.store(want, Ordering::Relaxed);
         let mut bar = toolbar::Out::default();
         egui::Panel::top("toolbar").show(ui, |ui| {
             bar = toolbar::show(ui, &self.history, &mut self.query, &mut self.settings.flat, self.admin, self.admin_rx.is_some());
