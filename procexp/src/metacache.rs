@@ -43,7 +43,7 @@ impl MetaCache {
         std::thread::Builder::new()
             .name("metacache".into())
             .spawn(move || {
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0) };
+                crate::darwin::set_background_qos();
                 for path in rx {
                     let m = Arc::new(compute(&path));
                     let mut s = st.lock().unwrap();

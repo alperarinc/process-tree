@@ -8,3 +8,5 @@ pub mod actions;
 pub mod backend;
 pub mod helper;
 pub mod metacache;
+pub mod settings;
+pub mod vt;
